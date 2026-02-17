@@ -1,0 +1,37 @@
+/* llimit dashboard — minimal overrides for Pico CSS */
+.budget-bar {
+    background: var(--pico-secondary-background);
+    border-radius: 4px;
+    height: 1.2rem;
+    overflow: hidden;
+    position: relative;
+}
+.budget-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s;
+}
+.budget-bar-fill.green { background: #2ecc71; }
+.budget-bar-fill.yellow { background: #f1c40f; }
+.budget-bar-fill.red { background: #e74c3c; }
+
+.latency-chip {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.8rem;
+    font-family: monospace;
+}
+.latency-chip.overhead { background: #3498db22; color: #2980b9; }
+.latency-chip.upstream { background: #e67e2222; color: #d35400; }
+.latency-chip.transfer { background: #9b59b622; color: #8e44ad; }
+.latency-chip.total { background: #2c3e5022; color: #2c3e50; }
+
+table { font-size: 0.9rem; }
+td.mono { font-family: monospace; font-size: 0.85rem; }
+.text-right { text-align: right; }
+.text-muted { opacity: 0.6; }
+.badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.75rem; }
+.badge-ok { background: #2ecc7122; color: #27ae60; }
+.badge-warn { background: #f1c40f22; color: #f39c12; }
+.badge-error { background: #e74c3c22; color: #c0392b; }

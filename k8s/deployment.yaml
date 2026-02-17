@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llimit
+  labels:
+    app: llimit
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: llimit
+  template:
+    metadata:
+      labels:
+        app: llimit
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: llimit
+          image: llimit:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AZURE_OPENAI_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-openai-endpoint
+            - name: AZURE_OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-openai-api-key
+            - name: LLIMIT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: admin-token
+            - name: LLIMIT_DB_PATH
+              value: /data/llimit.db
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: llimit-data
