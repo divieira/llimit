@@ -38,8 +38,9 @@ public record BudgetDeny(string Limit, string Scope, double Budget, double Used)
 
 public class BudgetCache
 {
-    private readonly ConcurrentDictionary<(string Pid, DateOnly Date), double> _project = new();
-    private readonly ConcurrentDictionary<(string Pid, string Uid, DateOnly Date), double> _user = new();
+    // Live counters — incremented on every request, atomically swapped on reconciliation
+    private volatile ConcurrentDictionary<(string Pid, DateOnly Date), double> _project = new();
+    private volatile ConcurrentDictionary<(string Pid, string Uid, DateOnly Date), double> _user = new();
 
     public void Add(string pid, string uid, double cost)
     {
@@ -48,93 +49,90 @@ public class BudgetCache
         _user.AddOrUpdate((pid, uid, d), cost, (_, v) => v + cost);
     }
 
-    public BudgetDeny? CheckDaily(string pid, string uid, double? projectLimit, double? userLimit)
+    public BudgetDeny? CheckAll(Project proj, string uid)
     {
-        var d = DateOnly.FromDateTime(DateTime.UtcNow);
+        return CheckPeriod("daily", proj.Id, uid, proj.BudgetDaily, proj.DefaultUserBudgetDaily, GetDayRange)
+            ?? CheckPeriod("weekly", proj.Id, uid, proj.BudgetWeekly, proj.DefaultUserBudgetWeekly, GetWeekRange)
+            ?? CheckPeriod("monthly", proj.Id, uid, proj.BudgetMonthly, proj.DefaultUserBudgetMonthly, GetMonthRange);
+    }
+
+    private BudgetDeny? CheckPeriod(string period, string pid, string uid,
+        double? projectLimit, double? userLimit, Func<(DateOnly from, DateOnly to)> rangeFunc)
+    {
         if (projectLimit is { } pl)
         {
-            var used = _project.GetValueOrDefault((pid, d));
-            if (used >= pl) return new BudgetDeny("daily", "project", pl, used);
+            var used = SumProjectCost(pid, rangeFunc());
+            if (used >= pl) return new BudgetDeny(period, "project", pl, used);
         }
         if (userLimit is { } ul && uid != "_anonymous")
         {
-            var used = _user.GetValueOrDefault((pid, uid, d));
-            if (used >= ul) return new BudgetDeny("daily", "user", ul, used);
+            var used = SumUserCost(pid, uid, rangeFunc());
+            if (used >= ul) return new BudgetDeny(period, "user", ul, used);
         }
         return null;
     }
 
-    public BudgetDeny? CheckWeekly(string pid, string uid, double? projectLimit, double? userLimit, Store store)
+    private double SumProjectCost(string pid, (DateOnly from, DateOnly to) range)
     {
-        if (projectLimit is { } pl)
-        {
-            var (from, to) = GetWeekRange();
-            var used = store.GetProjectCostForPeriod(pid, from, to);
-            if (used >= pl) return new BudgetDeny("weekly", "project", pl, used);
-        }
-        if (userLimit is { } ul && uid != "_anonymous")
-        {
-            var (from, to) = GetWeekRange();
-            var used = store.GetUserCostForPeriod(pid, uid, from, to);
-            if (used >= ul) return new BudgetDeny("weekly", "user", ul, used);
-        }
-        return null;
+        var proj = _project;
+        double total = 0;
+        for (var d = range.from; d <= range.to; d = d.AddDays(1))
+            total += proj.GetValueOrDefault((pid, d));
+        return total;
     }
 
-    public BudgetDeny? CheckMonthly(string pid, string uid, double? projectLimit, double? userLimit, Store store)
+    private double SumUserCost(string pid, string uid, (DateOnly from, DateOnly to) range)
     {
-        if (projectLimit is { } pl)
-        {
-            var (from, to) = GetMonthRange();
-            var used = store.GetProjectCostForPeriod(pid, from, to);
-            if (used >= pl) return new BudgetDeny("monthly", "project", pl, used);
-        }
-        if (userLimit is { } ul && uid != "_anonymous")
-        {
-            var (from, to) = GetMonthRange();
-            var used = store.GetUserCostForPeriod(pid, uid, from, to);
-            if (used >= ul) return new BudgetDeny("monthly", "user", ul, used);
-        }
-        return null;
-    }
-
-    public BudgetDeny? CheckAll(Project proj, string uid, Store store)
-    {
-        return CheckDaily(proj.Id, uid, proj.BudgetDaily, proj.DefaultUserBudgetDaily)
-            ?? CheckWeekly(proj.Id, uid, proj.BudgetWeekly, proj.DefaultUserBudgetWeekly, store)
-            ?? CheckMonthly(proj.Id, uid, proj.BudgetMonthly, proj.DefaultUserBudgetMonthly, store);
+        var user = _user;
+        double total = 0;
+        for (var d = range.from; d <= range.to; d = d.AddDays(1))
+            total += user.GetValueOrDefault((pid, uid, d));
+        return total;
     }
 
     public void LoadFromStore(Store store)
     {
-        _project.Clear();
-        _user.Clear();
-        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        // Build new dictionaries, then swap atomically — no race with concurrent Add() calls
+        var newProject = new ConcurrentDictionary<(string Pid, DateOnly Date), double>();
+        var newUser = new ConcurrentDictionary<(string Pid, string Uid, DateOnly Date), double>();
+
+        // Load current month's data (covers daily, weekly, and monthly checks)
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var monthStart = new DateOnly(today.Year, today.Month, 1);
         var projects = store.GetAllProjects();
         foreach (var proj in projects)
         {
-            var usage = store.GetUsage(proj.Id, today, today);
+            var usage = store.GetUsage(proj.Id, monthStart.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
             foreach (var u in usage)
             {
                 var d = DateOnly.ParseExact(u.Date, "yyyy-MM-dd");
-                _project.AddOrUpdate((proj.Id, d), u.TotalCost, (_, v) => v + u.TotalCost);
-                _user.AddOrUpdate((proj.Id, u.UserId, d), u.TotalCost, (_, v) => v + u.TotalCost);
+                newProject.AddOrUpdate((proj.Id, d), u.TotalCost, (_, v) => v + u.TotalCost);
+                newUser.AddOrUpdate((proj.Id, u.UserId, d), u.TotalCost, (_, v) => v + u.TotalCost);
             }
         }
+
+        _project = newProject;
+        _user = newUser;
     }
 
-    private static (string from, string to) GetWeekRange()
+    private static (DateOnly from, DateOnly to) GetDayRange()
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        return (today, today);
+    }
+
+    private static (DateOnly from, DateOnly to) GetWeekRange()
     {
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var from = today.AddDays(-(int)today.DayOfWeek);
-        return (from.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
+        return (from, today);
     }
 
-    private static (string from, string to) GetMonthRange()
+    private static (DateOnly from, DateOnly to) GetMonthRange()
     {
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var from = new DateOnly(today.Year, today.Month, 1);
-        return (from.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
+        return (from, today);
     }
 }
 

@@ -1,4 +1,6 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace LLimit;
 
@@ -35,7 +37,8 @@ public static class DashboardRoutes
         }
 
         var cookie = ctx.HttpContext.Request.Cookies["llimit_session"];
-        if (cookie != adminToken)
+        var expectedHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(adminToken))).ToLowerInvariant();
+        if (cookie != expectedHash)
         {
             ctx.HttpContext.Response.Redirect("/dashboard/login");
             return Results.Empty;
@@ -72,7 +75,8 @@ public static class DashboardRoutes
         if (string.IsNullOrEmpty(adminToken) || token != adminToken)
             return Results.Redirect("/dashboard/login?error=1");
 
-        ctx.Response.Cookies.Append("llimit_session", token, new CookieOptions
+        var sessionHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+        ctx.Response.Cookies.Append("llimit_session", sessionHash, new CookieOptions
         {
             HttpOnly = true,
             SameSite = SameSiteMode.Lax,
@@ -88,12 +92,13 @@ public static class DashboardRoutes
     {
         var projects = store.GetAllProjects();
         var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        var todayCosts = store.GetAllProjectCostsForDate(today);
 
         // Projects table rows
         var projectRows = "";
         foreach (var p in projects)
         {
-            var todayCost = store.GetProjectCostForPeriod(p.Id, today, today);
+            var todayCost = todayCosts.GetValueOrDefault(p.Id);
             var budgetBar = BuildBudgetBar(todayCost, p.BudgetDaily);
             var statusBadge = p.IsActive
                 ? "<span style=\"color:green;\">Active</span>"
@@ -625,7 +630,7 @@ public static class DashboardRoutes
 <head>
   <meta charset=""utf-8"">
   <meta name=""viewport"" content=""width=device-width, initial-scale=1"">
-  <title>{title} - LLimit</title>
+  <title>{Enc(title)} - LLimit</title>
   <link rel=""stylesheet"" href=""https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"">
   <script src=""https://unpkg.com/htmx.org@2.0.4""></script>
   <style>

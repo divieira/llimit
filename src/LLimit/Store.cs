@@ -225,6 +225,14 @@ public class Store : IDisposable
             new { projectId, from, to }).AsList();
     }
 
+    public Dictionary<string, double> GetAllProjectCostsForDate(string date)
+    {
+        using var conn = Open();
+        return conn.Query<(string ProjectId, double TotalCost)>(
+            "SELECT project_id AS ProjectId, COALESCE(SUM(total_cost), 0) AS TotalCost FROM usage_daily WHERE date = @date GROUP BY project_id",
+            new { date }).ToDictionary(x => x.ProjectId, x => x.TotalCost);
+    }
+
     public double GetProjectCostForPeriod(string projectId, string fromDate, string toDate)
     {
         using var conn = Open();

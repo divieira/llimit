@@ -7,7 +7,7 @@ public static class ProxyHandler
 {
     public static void MapProxy(this WebApplication app)
     {
-        app.Map("/openai/deployments/{deployment}/{**rest}", HandleProxy);
+        app.MapPost("/openai/deployments/{deployment}/{**rest}", HandleProxy);
     }
 
     private static async Task HandleProxy(HttpContext ctx, string deployment, string rest,
@@ -36,8 +36,8 @@ public static class ProxyHandler
 
         var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault() ?? "_anonymous";
 
-        // ── Budget check (in-memory, zero DB for daily; DB for weekly/monthly) ──
-        var deny = budget.CheckAll(proj, uid, store);
+        // ── Budget check (pure in-memory, zero DB) ──
+        var deny = budget.CheckAll(proj, uid);
         if (deny is not null)
         {
             ctx.Response.StatusCode = 429;

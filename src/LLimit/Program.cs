@@ -30,8 +30,9 @@ var pricingCache = app.Services.GetRequiredService<PricingCache>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
 // Load projects into auth cache
-authCache.Reload(store.GetAllProjects());
-logger.LogInformation("Loaded {Count} projects into auth cache", store.GetAllProjects().Count);
+var allProjects = store.GetAllProjects();
+authCache.Reload(allProjects);
+logger.LogInformation("Loaded {Count} projects into auth cache", allProjects.Count);
 
 // Load budget cache from DB
 budgetCache.LoadFromStore(store);
@@ -52,12 +53,14 @@ catch (Exception ex)
 }
 
 // ── Background tasks ──
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+var shutdownToken = lifetime.ApplicationStopping;
 
 // Periodic LiteLLM pricing refresh (every 6 hours)
 _ = Task.Run(async () =>
 {
     using var timer = new PeriodicTimer(TimeSpan.FromHours(6));
-    while (await timer.WaitForNextTickAsync())
+    while (await timer.WaitForNextTickAsync(shutdownToken))
     {
         try
         {
@@ -65,31 +68,31 @@ _ = Task.Run(async () =>
             await pricingCache.LoadFromLiteLlmAsync(http, store);
             logger.LogInformation("Pricing refreshed from LiteLLM");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             Interlocked.Increment(ref Diagnostics.PricingRefreshFailures);
             logger.LogError(ex, "Failed to refresh LiteLLM pricing");
         }
     }
-});
+}, shutdownToken);
 
 // Periodic budget cache reconciliation (every 5 minutes)
 _ = Task.Run(async () =>
 {
     using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
-    while (await timer.WaitForNextTickAsync())
+    while (await timer.WaitForNextTickAsync(shutdownToken))
     {
         try
         {
             budgetCache.LoadFromStore(store);
             logger.LogDebug("Budget cache reconciled from DB");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogError(ex, "Failed to reconcile budget cache");
         }
     }
-});
+}, shutdownToken);
 
 // ── Health ──
 app.MapGet("/health", (Store s) =>
@@ -114,7 +117,6 @@ app.MapAdmin();
 app.MapDashboard();
 
 // ── Graceful shutdown ──
-var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
 {
     logger.LogInformation("Shutting down — flushing pending operations");

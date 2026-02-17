@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace LLimit;
 
 public static class AdminRoutes
@@ -40,7 +43,10 @@ public static class AdminRoutes
         }
 
         var auth = ctx.HttpContext.Request.Headers.Authorization.FirstOrDefault();
-        if (auth is null || !auth.StartsWith("Bearer ") || auth[7..] != adminToken)
+        if (auth is null || !auth.StartsWith("Bearer ") ||
+            !CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(auth[7..]),
+                Encoding.UTF8.GetBytes(adminToken)))
         {
             ctx.HttpContext.Response.StatusCode = 401;
             return new { error = "unauthorized" };
@@ -55,16 +61,13 @@ public static class AdminRoutes
     {
         var projects = store.GetAllProjects();
         var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
-        var result = projects.Select(p =>
+        var todayCosts = store.GetAllProjectCostsForDate(today);
+        var result = projects.Select(p => new
         {
-            var todayCost = store.GetProjectCostForPeriod(p.Id, today, today);
-            return new
-            {
-                p.Id, p.Name, p.IsActive,
-                p.BudgetDaily, p.BudgetWeekly, p.BudgetMonthly,
-                p.DefaultUserBudgetDaily, p.DefaultUserBudgetWeekly, p.DefaultUserBudgetMonthly,
-                UsageToday = todayCost
-            };
+            p.Id, p.Name, p.IsActive,
+            p.BudgetDaily, p.BudgetWeekly, p.BudgetMonthly,
+            p.DefaultUserBudgetDaily, p.DefaultUserBudgetWeekly, p.DefaultUserBudgetMonthly,
+            UsageToday = todayCosts.GetValueOrDefault(p.Id)
         });
         return Results.Ok(result);
     }
@@ -170,6 +173,7 @@ public static class AdminRoutes
     private static IResult GetPricing(Store store, PricingCache pricingCache)
     {
         var adminOverrides = store.GetAllPricing();
+        var adminSet = new HashSet<string>(adminOverrides.Select(o => o.ModelPattern), StringComparer.OrdinalIgnoreCase);
         var allPrices = pricingCache.GetAllPrices();
 
         var result = allPrices.Select(kv => new
@@ -177,7 +181,7 @@ public static class AdminRoutes
             Model = kv.Key,
             InputPerMillion = kv.Value.InputPerToken * 1_000_000,
             OutputPerMillion = kv.Value.OutputPerToken * 1_000_000,
-            Source = adminOverrides.Any(o => o.ModelPattern == kv.Key) ? "admin" : "litellm"
+            Source = adminSet.Contains(kv.Key) ? "admin" : "litellm"
         }).OrderBy(x => x.Model);
 
         return Results.Ok(result);
@@ -190,15 +194,20 @@ public static class AdminRoutes
         return Results.Ok(new { message = "pricing updated", modelPattern });
     }
 
-    private static IResult DeletePricing(string modelPattern, Store store, PricingCache pricingCache, IHttpClientFactory factory)
+    private static async Task<IResult> DeletePricing(string modelPattern, Store store, PricingCache pricingCache, IHttpClientFactory factory)
     {
         store.DeletePricing(modelPattern);
         // Reload full pricing to remove the override and revert to LiteLLM
-        _ = Task.Run(async () =>
+        try
         {
-            var http = factory.CreateClient();
+            using var http = factory.CreateClient();
             await pricingCache.LoadFromLiteLlmAsync(http, store);
-        });
+        }
+        catch (Exception)
+        {
+            // LiteLLM fetch failed — at least re-apply overrides from DB to remove the deleted one
+            pricingCache.ApplyAdminOverrides(store);
+        }
         return Results.Ok(new { message = "pricing override removed, reverting to LiteLLM", modelPattern });
     }
 
