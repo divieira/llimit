@@ -65,8 +65,7 @@ public static class AdminRoutes
         var result = projects.Select(p => new
         {
             p.Id, p.Name, p.IsActive,
-            p.BudgetDaily, p.BudgetWeekly, p.BudgetMonthly,
-            p.DefaultUserBudgetDaily, p.DefaultUserBudgetWeekly, p.DefaultUserBudgetMonthly,
+            p.BudgetDaily, p.DefaultUserBudgetDaily,
             UsageToday = todayCosts.GetValueOrDefault(p.Id)
         });
         return Results.Ok(result);
@@ -80,15 +79,14 @@ public static class AdminRoutes
         try
         {
             var (project, plainKey) = store.CreateProject(req.Id, req.Name,
-                req.BudgetDaily, req.BudgetWeekly, req.BudgetMonthly,
-                req.DefaultUserBudgetDaily, req.DefaultUserBudgetWeekly, req.DefaultUserBudgetMonthly);
+                req.BudgetDaily, req.DefaultUserBudgetDaily);
 
             authCache.Reload(store.GetAllProjects());
 
             return Results.Created($"/api/v1/projects/{project.Id}", new
             {
                 project.Id, project.Name, ApiKey = plainKey,
-                project.BudgetDaily, project.BudgetWeekly, project.BudgetMonthly
+                project.BudgetDaily, project.DefaultUserBudgetDaily
             });
         }
         catch (Exception ex) when (ex.Message.Contains("UNIQUE"))
@@ -103,13 +101,12 @@ public static class AdminRoutes
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
         var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
-        var todayCost = store.GetProjectCostForPeriod(id, today, today);
+        var todayCost = store.GetProjectCostForDate(id, today);
 
         return Results.Ok(new
         {
             project.Id, project.Name, project.IsActive,
-            project.BudgetDaily, project.BudgetWeekly, project.BudgetMonthly,
-            project.DefaultUserBudgetDaily, project.DefaultUserBudgetWeekly, project.DefaultUserBudgetMonthly,
+            project.BudgetDaily, project.DefaultUserBudgetDaily,
             project.CreatedAt, project.UpdatedAt,
             UsageToday = todayCost
         });
@@ -120,8 +117,7 @@ public static class AdminRoutes
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
-        store.UpdateProject(id, req.Name, req.BudgetDaily, req.BudgetWeekly, req.BudgetMonthly,
-            req.DefaultUserBudgetDaily, req.DefaultUserBudgetWeekly, req.DefaultUserBudgetMonthly, req.IsActive);
+        store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive);
 
         authCache.Reload(store.GetAllProjects());
         return Results.Ok(store.GetProject(id));
@@ -231,12 +227,10 @@ public static class AdminRoutes
 // ── Request DTOs ──
 
 public record CreateProjectRequest(string Id, string Name,
-    double? BudgetDaily = null, double? BudgetWeekly = null, double? BudgetMonthly = null,
-    double? DefaultUserBudgetDaily = null, double? DefaultUserBudgetWeekly = null, double? DefaultUserBudgetMonthly = null);
+    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null);
 
 public record UpdateProjectRequest(string? Name = null,
-    double? BudgetDaily = null, double? BudgetWeekly = null, double? BudgetMonthly = null,
-    double? DefaultUserBudgetDaily = null, double? DefaultUserBudgetWeekly = null, double? DefaultUserBudgetMonthly = null,
+    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null,
     bool? IsActive = null);
 
 public record UpsertPricingRequest(double InputPerMillion, double OutputPerMillion);

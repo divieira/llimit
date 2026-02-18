@@ -29,116 +29,11 @@ public class AuthCache
         => _byHash = all.ToDictionary(p => p.ApiKeyHash);
 }
 
-// ── Budget Cache (separate dicts, tuple keys) ──
+// ── Budget check result ──
 
-public record BudgetDeny(string Limit, string Scope, double Budget, double Used)
+public record BudgetDeny(string Scope, double Budget, double Used)
 {
     public string Error { get; } = "budget_exceeded";
-}
-
-public class BudgetCache
-{
-    // Live counters — incremented on every request, atomically swapped on reconciliation
-    private volatile ConcurrentDictionary<(string Pid, DateOnly Date), double> _projectCost = new();
-    private volatile ConcurrentDictionary<(string Pid, string Uid, DateOnly Date), double> _userCost = new();
-
-    public void Add(string pid, string? uid, double cost)
-    {
-        var d = DateOnly.FromDateTime(DateTime.UtcNow);
-        _projectCost.AddOrUpdate((pid, d), cost, (_, v) => v + cost);
-        if (uid is not null)
-            _userCost.AddOrUpdate((pid, uid, d), cost, (_, v) => v + cost);
-    }
-
-    public BudgetDeny? CheckAll(Project proj, string? uid)
-    {
-        return CheckPeriod("daily", proj.Id, uid, proj.BudgetDaily, proj.DefaultUserBudgetDaily, GetDayRange)
-            ?? CheckPeriod("weekly", proj.Id, uid, proj.BudgetWeekly, proj.DefaultUserBudgetWeekly, GetWeekRange)
-            ?? CheckPeriod("monthly", proj.Id, uid, proj.BudgetMonthly, proj.DefaultUserBudgetMonthly, GetMonthRange);
-    }
-
-    private BudgetDeny? CheckPeriod(string period, string pid, string? uid,
-        double? projectLimit, double? userLimit, Func<(DateOnly from, DateOnly to)> rangeFunc)
-    {
-        if (projectLimit is { } pl)
-        {
-            var used = SumProjectCost(pid, rangeFunc());
-            if (used >= pl) return new BudgetDeny(period, "project", pl, used);
-        }
-        if (userLimit is { } ul && uid is not null)
-        {
-            var used = SumUserCost(pid, uid, rangeFunc());
-            if (used >= ul) return new BudgetDeny(period, "user", ul, used);
-        }
-        return null;
-    }
-
-    private double SumProjectCost(string pid, (DateOnly from, DateOnly to) range)
-    {
-        var costs = _projectCost;
-        double total = 0;
-        for (var d = range.from; d <= range.to; d = d.AddDays(1))
-            total += costs.GetValueOrDefault((pid, d));
-        return total;
-    }
-
-    private double SumUserCost(string pid, string uid, (DateOnly from, DateOnly to) range)
-    {
-        var costs = _userCost;
-        double total = 0;
-        for (var d = range.from; d <= range.to; d = d.AddDays(1))
-            total += costs.GetValueOrDefault((pid, uid, d));
-        return total;
-    }
-
-    public void LoadFromStore(Store store)
-    {
-        // Build new dictionaries, then swap atomically — no race with concurrent Add() calls
-        var newProjectCost = new ConcurrentDictionary<(string Pid, DateOnly Date), double>();
-        var newUserCost = new ConcurrentDictionary<(string Pid, string Uid, DateOnly Date), double>();
-
-        // Load data from the earliest possible budget window start (month start or week start,
-        // whichever is earlier) to cover daily, weekly, and monthly checks
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var monthStart = new DateOnly(today.Year, today.Month, 1);
-        var weekStart = today.AddDays(-(int)today.DayOfWeek);
-        var startDate = weekStart < monthStart ? weekStart : monthStart;
-
-        var projects = store.GetAllProjects();
-        foreach (var proj in projects)
-        {
-            var usage = store.GetUsage(proj.Id, startDate.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
-            foreach (var u in usage)
-            {
-                var d = DateOnly.ParseExact(u.Date, "yyyy-MM-dd");
-                newProjectCost.AddOrUpdate((proj.Id, d), u.TotalCost, (_, v) => v + u.TotalCost);
-                newUserCost.AddOrUpdate((proj.Id, u.UserId, d), u.TotalCost, (_, v) => v + u.TotalCost);
-            }
-        }
-
-        _projectCost = newProjectCost;
-        _userCost = newUserCost;
-    }
-
-    private static (DateOnly from, DateOnly to) GetDayRange()
-    {
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        return (today, today);
-    }
-
-    private static (DateOnly from, DateOnly to) GetWeekRange()
-    {
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var from = today.AddDays(-(int)today.DayOfWeek);
-        return (from, today);
-    }
-
-    private static (DateOnly from, DateOnly to) GetMonthRange()
-    {
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var from = new DateOnly(today.Year, today.Month, 1);
-        return (from, today);
-    }
 }
 
 // ── Pricing Cache (LiteLLM + admin overrides) ──
@@ -160,7 +55,6 @@ public class PricingCache
 
     /// <summary>
     /// Returns (cost, found: true) if the model has pricing, or (0, found: false) if unknown.
-    /// Callers should decide how to handle unknown models (e.g. reject the request).
     /// </summary>
     public (double cost, bool found) Calculate(string model, int promptTokens, int completionTokens)
     {

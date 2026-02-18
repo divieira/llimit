@@ -12,7 +12,6 @@ builder.Services.AddSingleton(sp =>
     return new Store(dbPath);
 });
 builder.Services.AddSingleton<AuthCache>();
-builder.Services.AddSingleton<BudgetCache>();
 builder.Services.AddSingleton<PricingCache>();
 builder.Services.AddHttpClient("Azure", client =>
 {
@@ -25,7 +24,6 @@ var app = builder.Build();
 // ── Startup: load caches ──
 var store = app.Services.GetRequiredService<Store>();
 var authCache = app.Services.GetRequiredService<AuthCache>();
-var budgetCache = app.Services.GetRequiredService<BudgetCache>();
 var pricingCache = app.Services.GetRequiredService<PricingCache>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
@@ -33,10 +31,6 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var allProjects = store.GetAllProjects();
 authCache.Reload(allProjects);
 logger.LogInformation("Loaded {Count} projects into auth cache", allProjects.Count);
-
-// Load budget cache from DB
-budgetCache.LoadFromStore(store);
-logger.LogInformation("Budget cache loaded from DB");
 
 // Validate required Azure configuration — fail fast on startup
 var azureEndpoint = builder.Configuration["AZURE_OPENAI_ENDPOINT"]
@@ -83,24 +77,6 @@ _ = Task.Run(async () =>
     }
 }, shutdownToken);
 
-// Periodic budget cache reconciliation (every 5 minutes)
-_ = Task.Run(async () =>
-{
-    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
-    while (await timer.WaitForNextTickAsync(shutdownToken))
-    {
-        try
-        {
-            budgetCache.LoadFromStore(store);
-            logger.LogDebug("Budget cache reconciled from DB");
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            logger.LogError(ex, "Failed to reconcile budget cache");
-        }
-    }
-}, shutdownToken);
-
 // ── Health ──
 app.MapGet("/health", (Store s) =>
 {
@@ -124,9 +100,8 @@ app.MapAdmin();
 app.MapDashboard();
 
 // ── Graceful shutdown ──
-// Wait for in-flight requests to complete. The cancellation token stops background timers,
-// and Kestrel's shutdown timeout (default 30s, configurable via ASPNETCORE_SHUTDOWNTIMEOUT)
-// handles draining active HTTP connections.
+// The cancellation token stops background timers, and Kestrel's shutdown timeout
+// (default 30s, configurable via ASPNETCORE_SHUTDOWNTIMEOUT) drains active connections.
 // See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/host/generic-host#shutdowntimeout
 lifetime.ApplicationStopping.Register(() =>
 {

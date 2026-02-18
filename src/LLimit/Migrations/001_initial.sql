@@ -3,11 +3,7 @@ CREATE TABLE IF NOT EXISTS projects (
     name        TEXT NOT NULL,
     api_key_hash TEXT NOT NULL UNIQUE,
     budget_daily    REAL,
-    budget_weekly   REAL,
-    budget_monthly  REAL,
     default_user_budget_daily   REAL,
-    default_user_budget_weekly  REAL,
-    default_user_budget_monthly REAL,
     is_active   INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL

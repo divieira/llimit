@@ -11,7 +11,7 @@ public static class ProxyHandler
     }
 
     private static async Task HandleProxy(HttpContext ctx, string deployment, string rest,
-        AuthCache auth, BudgetCache budget, PricingCache pricing, Store store,
+        AuthCache auth, PricingCache pricing, Store store,
         IHttpClientFactory factory, IConfiguration cfg, ILogger<Program> logger)
     {
         var sw = Stopwatch.StartNew();
@@ -36,13 +36,27 @@ public static class ProxyHandler
 
         var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault();
 
-        // ── Budget check (pure in-memory, zero DB) ──
-        var deny = budget.CheckAll(proj, uid);
-        if (deny is not null)
+        // ── Budget check (daily only, queries DB) ──
+        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        if (proj.BudgetDaily is { } projectLimit)
         {
-            ctx.Response.StatusCode = 429;
-            await ctx.Response.WriteAsJsonAsync(deny);
-            return;
+            var used = store.GetProjectCostForDate(proj.Id, today);
+            if (used >= projectLimit)
+            {
+                ctx.Response.StatusCode = 429;
+                await ctx.Response.WriteAsJsonAsync(new BudgetDeny("project", projectLimit, used));
+                return;
+            }
+        }
+        if (proj.DefaultUserBudgetDaily is { } userLimit && uid is not null)
+        {
+            var used = store.GetUserCostForDate(proj.Id, uid, today);
+            if (used >= userLimit)
+            {
+                ctx.Response.StatusCode = 429;
+                await ctx.Response.WriteAsJsonAsync(new BudgetDeny("user", userLimit, used));
+                return;
+            }
         }
 
         // ── Read body, inject stream_options ──
@@ -125,21 +139,18 @@ public static class ProxyHandler
         }
 
         // ── Stream or buffer response ──
-        if (isStream)
+        using (resp)
         {
-            await HandleStream(ctx, resp, proj, uid, deployment, endpoint, pricing, budget, store, logger, sw, overheadMs, upstreamMs);
+            if (isStream)
+                await HandleStream(ctx, resp, proj, uid, deployment, endpoint, pricing, store, logger, sw, overheadMs, upstreamMs);
+            else
+                await HandleBuffer(ctx, resp, proj, uid, deployment, endpoint, pricing, store, logger, sw, overheadMs, upstreamMs);
         }
-        else
-        {
-            await HandleBuffer(ctx, resp, proj, uid, deployment, endpoint, pricing, budget, store, logger, sw, overheadMs, upstreamMs);
-        }
-
-        resp.Dispose();
     }
 
     private static async Task HandleBuffer(HttpContext ctx, HttpResponseMessage resp,
         Project proj, string? uid, string deployment, string endpoint,
-        PricingCache pricing, BudgetCache budget, Store store, ILogger logger,
+        PricingCache pricing, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
         var body = await resp.Content.ReadAsByteArrayAsync();
@@ -148,7 +159,7 @@ public static class ProxyHandler
         var totalMs = (int)sw.ElapsedMilliseconds;
         var transferMs = totalMs - overheadMs - upstreamMs;
 
-        // Fire-and-forget: extract usage, calculate cost, update cache, log
+        // Fire-and-forget: extract usage, calculate cost, log
         _ = Task.Run(() =>
         {
             try
@@ -170,7 +181,6 @@ public static class ProxyHandler
                 catch { }
 
                 var (cost, found) = pricing.Calculate(model, pt, ct);
-                budget.Add(proj.Id, uid, cost);
                 var now = DateTime.UtcNow;
                 var dbUid = uid ?? "_anonymous";
                 store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,
@@ -187,7 +197,7 @@ public static class ProxyHandler
 
     private static async Task HandleStream(HttpContext ctx, HttpResponseMessage resp,
         Project proj, string? uid, string deployment, string endpoint,
-        PricingCache pricing, BudgetCache budget, Store store, ILogger logger,
+        PricingCache pricing, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
         var model = "";
@@ -228,7 +238,6 @@ public static class ProxyHandler
             try
             {
                 var (cost, found) = pricing.Calculate(model, pt, ct);
-                budget.Add(proj.Id, uid, cost);
                 var now = DateTime.UtcNow;
                 var dbUid = uid ?? "_anonymous";
                 store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,

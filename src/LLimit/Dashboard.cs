@@ -111,8 +111,6 @@ public static class DashboardRoutes
   <td>{statusBadge}</td>
   <td>${todayCost:F4}</td>
   <td>{Fmt(p.BudgetDaily)}</td>
-  <td>{Fmt(p.BudgetWeekly)}</td>
-  <td>{Fmt(p.BudgetMonthly)}</td>
   <td style=""min-width:120px;"">{budgetBar}</td>
 </tr>";
         }
@@ -162,11 +160,11 @@ public static class DashboardRoutes
       <thead>
         <tr>
           <th>Name</th><th>ID</th><th>Status</th><th>Today</th>
-          <th>Daily Limit</th><th>Weekly Limit</th><th>Monthly Limit</th><th>Daily Usage</th>
+          <th>Daily Limit</th><th>Daily Usage</th>
         </tr>
       </thead>
       <tbody>
-        {(projectRows.Length > 0 ? projectRows : "<tr><td colspan=\"8\">No projects yet</td></tr>")}
+        {(projectRows.Length > 0 ? projectRows : "<tr><td colspan=\"6\">No projects yet</td></tr>")}
       </tbody>
     </table>
     </figure>
@@ -224,7 +222,7 @@ public static class DashboardRoutes
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var weekAgo = today.AddDays(-7);
         var usage = store.GetUsage(id, weekAgo.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
-        var todayCost = store.GetProjectCostForPeriod(id, today.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
+        var todayCost = store.GetProjectCostForDate(id, today.ToString("yyyy-MM-dd"));
 
         // Users table
         var userRows = "";
@@ -312,22 +310,12 @@ public static class DashboardRoutes
 
   <section>
     <h3>Budget</h3>
-    <div class=""grid"">
-      <article>
-        <header>Daily</header>
-        <p>Limit: {Fmt(project.BudgetDaily)}</p>
-        <p>Used: ${todayCost:F4}</p>
-        {BuildBudgetBar(todayCost, project.BudgetDaily)}
-      </article>
-      <article>
-        <header>Weekly</header>
-        <p>Limit: {Fmt(project.BudgetWeekly)}</p>
-      </article>
-      <article>
-        <header>Monthly</header>
-        <p>Limit: {Fmt(project.BudgetMonthly)}</p>
-      </article>
-    </div>
+    <article>
+      <header>Daily</header>
+      <p>Project limit: {Fmt(project.BudgetDaily)} | Per-user limit: {Fmt(project.DefaultUserBudgetDaily)}</p>
+      <p>Used today: ${todayCost:F4}</p>
+      {BuildBudgetBar(todayCost, project.BudgetDaily)}
+    </article>
   </section>
 
   <section>
@@ -403,7 +391,7 @@ public static class DashboardRoutes
 
         var prevDisabled = page <= 1 ? "aria-disabled=\"true\"" : "";
         var nextDisabled = logs.Count < perPage ? "aria-disabled=\"true\"" : "";
-        var filterQs = (userId != null ? $"&user={Enc(userId)}" : "") + (model != null ? $"&model={Enc(model)}" : "");
+        var filterQs = (userId != null ? $"&user={WebUtility.UrlEncode(userId)}" : "") + (model != null ? $"&model={WebUtility.UrlEncode(model)}" : "");
 
         var html = Layout($"Logs: {Enc(project.Name)}", $@"
 <main class=""container"">
@@ -482,31 +470,13 @@ public static class DashboardRoutes
     </fieldset>
 
     <fieldset>
-      <legend>Project Budgets</legend>
+      <legend>Daily Budgets</legend>
       <div class=""grid"">
-        <label>Daily ($)
+        <label>Project ($)
           <input type=""number"" name=""budgetDaily"" step=""0.01"" value=""{Val(project.BudgetDaily)}"" placeholder=""No limit"">
         </label>
-        <label>Weekly ($)
-          <input type=""number"" name=""budgetWeekly"" step=""0.01"" value=""{Val(project.BudgetWeekly)}"" placeholder=""No limit"">
-        </label>
-        <label>Monthly ($)
-          <input type=""number"" name=""budgetMonthly"" step=""0.01"" value=""{Val(project.BudgetMonthly)}"" placeholder=""No limit"">
-        </label>
-      </div>
-    </fieldset>
-
-    <fieldset>
-      <legend>Default User Budgets</legend>
-      <div class=""grid"">
-        <label>Daily ($)
+        <label>Per-User ($)
           <input type=""number"" name=""defaultUserBudgetDaily"" step=""0.01"" value=""{Val(project.DefaultUserBudgetDaily)}"" placeholder=""No limit"">
-        </label>
-        <label>Weekly ($)
-          <input type=""number"" name=""defaultUserBudgetWeekly"" step=""0.01"" value=""{Val(project.DefaultUserBudgetWeekly)}"" placeholder=""No limit"">
-        </label>
-        <label>Monthly ($)
-          <input type=""number"" name=""defaultUserBudgetMonthly"" step=""0.01"" value=""{Val(project.DefaultUserBudgetMonthly)}"" placeholder=""No limit"">
         </label>
       </div>
     </fieldset>
@@ -527,19 +497,14 @@ public static class DashboardRoutes
         var name = form["name"].FirstOrDefault();
         var isActive = form["isActive"].FirstOrDefault() == "true";
         var budgetDaily = ParseDouble(form["budgetDaily"].FirstOrDefault());
-        var budgetWeekly = ParseDouble(form["budgetWeekly"].FirstOrDefault());
-        var budgetMonthly = ParseDouble(form["budgetMonthly"].FirstOrDefault());
         var defaultUserBudgetDaily = ParseDouble(form["defaultUserBudgetDaily"].FirstOrDefault());
-        var defaultUserBudgetWeekly = ParseDouble(form["defaultUserBudgetWeekly"].FirstOrDefault());
-        var defaultUserBudgetMonthly = ParseDouble(form["defaultUserBudgetMonthly"].FirstOrDefault());
 
-        store.UpdateProject(id, name, budgetDaily, budgetWeekly, budgetMonthly,
-            defaultUserBudgetDaily, defaultUserBudgetWeekly, defaultUserBudgetMonthly, isActive,
+        store.UpdateProject(id, name, budgetDaily, defaultUserBudgetDaily, isActive,
             clearBudgets: true);
 
         authCache.Reload(store.GetAllProjects());
 
-        return Results.Redirect($"/dashboard/projects/{id}/settings?saved=1");
+        return Results.Redirect($"/dashboard/projects/{WebUtility.UrlEncode(id)}/settings?saved=1");
     }
 
     // ── Pricing Page ──

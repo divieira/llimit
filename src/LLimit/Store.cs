@@ -7,8 +7,7 @@ namespace LLimit;
 
 public record Project(
     string Id, string Name, string ApiKeyHash,
-    double? BudgetDaily, double? BudgetWeekly, double? BudgetMonthly,
-    double? DefaultUserBudgetDaily, double? DefaultUserBudgetWeekly, double? DefaultUserBudgetMonthly,
+    double? BudgetDaily, double? DefaultUserBudgetDaily,
     bool IsActive, string CreatedAt, string UpdatedAt);
 
 public record ModelPricing(string ModelPattern, double InputPerMillion, double OutputPerMillion, string UpdatedAt);
@@ -67,8 +66,8 @@ public class Store : IDisposable
     {
         using var conn = Open();
         return conn.Query<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, budget_weekly AS BudgetWeekly, budget_monthly AS BudgetMonthly, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, default_user_budget_weekly AS DefaultUserBudgetWeekly, default_user_budget_monthly AS DefaultUserBudgetMonthly, " +
+            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
+            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
             "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt FROM projects").AsList();
     }
 
@@ -76,14 +75,13 @@ public class Store : IDisposable
     {
         using var conn = Open();
         return conn.QueryFirstOrDefault<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, budget_weekly AS BudgetWeekly, budget_monthly AS BudgetMonthly, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, default_user_budget_weekly AS DefaultUserBudgetWeekly, default_user_budget_monthly AS DefaultUserBudgetMonthly, " +
+            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
+            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
             "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt FROM projects WHERE id = @id", new { id });
     }
 
     public (Project project, string plainKey) CreateProject(string id, string name,
-        double? budgetDaily = null, double? budgetWeekly = null, double? budgetMonthly = null,
-        double? defaultUserBudgetDaily = null, double? defaultUserBudgetWeekly = null, double? defaultUserBudgetMonthly = null)
+        double? budgetDaily = null, double? defaultUserBudgetDaily = null)
     {
         var plainKey = $"llimit-{Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant()}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(plainKey))).ToLowerInvariant();
@@ -91,18 +89,16 @@ public class Store : IDisposable
 
         using var conn = Open();
         conn.Execute(
-            "INSERT INTO projects (id, name, api_key_hash, budget_daily, budget_weekly, budget_monthly, " +
-            "default_user_budget_daily, default_user_budget_weekly, default_user_budget_monthly, is_active, created_at, updated_at) " +
-            "VALUES (@id, @name, @hash, @budgetDaily, @budgetWeekly, @budgetMonthly, @defaultUserBudgetDaily, @defaultUserBudgetWeekly, @defaultUserBudgetMonthly, 1, @now, @now)",
-            new { id, name, hash, budgetDaily, budgetWeekly, budgetMonthly, defaultUserBudgetDaily, defaultUserBudgetWeekly, defaultUserBudgetMonthly, now });
+            "INSERT INTO projects (id, name, api_key_hash, budget_daily, default_user_budget_daily, is_active, created_at, updated_at) " +
+            "VALUES (@id, @name, @hash, @budgetDaily, @defaultUserBudgetDaily, 1, @now, @now)",
+            new { id, name, hash, budgetDaily, defaultUserBudgetDaily, now });
 
         var project = GetProject(id)!;
         return (project, plainKey);
     }
 
     public void UpdateProject(string id, string? name = null,
-        double? budgetDaily = null, double? budgetWeekly = null, double? budgetMonthly = null,
-        double? defaultUserBudgetDaily = null, double? defaultUserBudgetWeekly = null, double? defaultUserBudgetMonthly = null,
+        double? budgetDaily = null, double? defaultUserBudgetDaily = null,
         bool? isActive = null, bool clearBudgets = false)
     {
         var now = DateTime.UtcNow.ToString("o");
@@ -111,15 +107,11 @@ public class Store : IDisposable
         var sets = new List<string> { "updated_at = @now" };
         if (name != null) sets.Add("name = @name");
         if (clearBudgets || budgetDaily != null) sets.Add("budget_daily = @budgetDaily");
-        if (clearBudgets || budgetWeekly != null) sets.Add("budget_weekly = @budgetWeekly");
-        if (clearBudgets || budgetMonthly != null) sets.Add("budget_monthly = @budgetMonthly");
         if (clearBudgets || defaultUserBudgetDaily != null) sets.Add("default_user_budget_daily = @defaultUserBudgetDaily");
-        if (clearBudgets || defaultUserBudgetWeekly != null) sets.Add("default_user_budget_weekly = @defaultUserBudgetWeekly");
-        if (clearBudgets || defaultUserBudgetMonthly != null) sets.Add("default_user_budget_monthly = @defaultUserBudgetMonthly");
         if (isActive != null) sets.Add("is_active = @isActive");
 
         conn.Execute($"UPDATE projects SET {string.Join(", ", sets)} WHERE id = @id",
-            new { id, name, budgetDaily, budgetWeekly, budgetMonthly, defaultUserBudgetDaily, defaultUserBudgetWeekly, defaultUserBudgetMonthly, isActive, now });
+            new { id, name, budgetDaily, defaultUserBudgetDaily, isActive, now });
     }
 
     public void DeactivateProject(string id)
@@ -233,20 +225,20 @@ public class Store : IDisposable
             new { date }).ToDictionary(x => x.ProjectId, x => x.TotalCost);
     }
 
-    public double GetProjectCostForPeriod(string projectId, string fromDate, string toDate)
+    public double GetProjectCostForDate(string projectId, string date)
     {
         using var conn = Open();
         return conn.ExecuteScalar<double>(
-            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND date >= @fromDate AND date <= @toDate",
-            new { projectId, fromDate, toDate });
+            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND date = @date",
+            new { projectId, date });
     }
 
-    public double GetUserCostForPeriod(string projectId, string userId, string fromDate, string toDate)
+    public double GetUserCostForDate(string projectId, string userId, string date)
     {
         using var conn = Open();
         return conn.ExecuteScalar<double>(
-            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND user_id = @userId AND date >= @fromDate AND date <= @toDate",
-            new { projectId, userId, fromDate, toDate });
+            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND user_id = @userId AND date = @date",
+            new { projectId, userId, date });
     }
 
     public List<(string UserId, double TodayCost)> GetProjectUsers(string projectId)
