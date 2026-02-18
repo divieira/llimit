@@ -1,71 +1,36 @@
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 
 namespace LLimit;
 
-// ── Auth Cache ──
-
-public class AuthCache
-{
-    private volatile Dictionary<string, Project> _byHash = new();
-
-    public Project? Resolve(string apiKey)
-    {
-        if (string.IsNullOrEmpty(apiKey)) return null;
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
-        return _byHash.TryGetValue(hash, out var p) && p.IsActive ? p : null;
-    }
-
-    public Project? ResolveIncludingInactive(string apiKey)
-    {
-        if (string.IsNullOrEmpty(apiKey)) return null;
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
-        return _byHash.GetValueOrDefault(hash);
-    }
-
-    public void Reload(IEnumerable<Project> all)
-        => _byHash = all.ToDictionary(p => p.ApiKeyHash);
-}
-
-// ── Budget check result ──
-
-public record BudgetDeny(string Scope, double Budget, double Used)
-{
-    public string Error { get; } = "budget_exceeded";
-}
-
-// ── Pricing Cache (LiteLLM + admin overrides) ──
-
 public record ModelPrice(double InputPerToken, double OutputPerToken);
 
-public class PricingCache
+public class PricingTable
 {
     private volatile Dictionary<string, ModelPrice> _prices = new();
-    private readonly ILogger<PricingCache> _logger;
+    private readonly ILogger<PricingTable> _logger;
     private DateTime _lastRefreshed;
 
     public DateTime LastRefreshed => _lastRefreshed;
 
-    public PricingCache(ILogger<PricingCache> logger)
+    public PricingTable(ILogger<PricingTable> logger)
     {
         _logger = logger;
     }
 
     /// <summary>
-    /// Returns (cost, found: true) if the model has pricing, or (0, found: false) if unknown.
+    /// Returns the cost for the given model and token counts, or null if the model is unknown.
     /// </summary>
-    public (double cost, bool found) Calculate(string model, int promptTokens, int completionTokens)
+    public double? Calculate(string model, int promptTokens, int completionTokens)
     {
         var prices = _prices;
         if (prices.TryGetValue(model, out var price))
-            return (promptTokens * price.InputPerToken + completionTokens * price.OutputPerToken, true);
+            return promptTokens * price.InputPerToken + completionTokens * price.OutputPerToken;
 
         Interlocked.Increment(ref Diagnostics.UnknownModelHits);
         Diagnostics.UnknownModels.AddOrUpdate(model, 1, (_, v) => v + 1);
         _logger.LogWarning("Unknown model {Model} — no pricing found", model);
-        return (0, false);
+        return null;
     }
 
     public async Task LoadFromLiteLlmAsync(HttpClient http, Store store)

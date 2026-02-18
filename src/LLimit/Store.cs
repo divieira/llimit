@@ -13,14 +13,14 @@ public record Project(
 public record ModelPricing(string ModelPattern, double InputPerMillion, double OutputPerMillion, string UpdatedAt);
 
 public record RequestLogEntry(
-    long Id, string ProjectId, string UserId, string Timestamp,
+    long Id, string ProjectId, string? UserId, string Timestamp,
     string Model, string Deployment, string Endpoint,
     int PromptTokens, int CompletionTokens, int TotalTokens,
     double CostUsd, int StatusCode,
     int OverheadMs, int UpstreamMs, int TransferMs, int TotalMs,
     bool IsStream, bool UsedFallbackPricing);
 
-public record UsageDaily(string ProjectId, string UserId, string Date,
+public record UsageDaily(string ProjectId, string? UserId, string Date,
     double TotalCost, int PromptTokens, int CompletionTokens, int RequestCount);
 
 public class Store : IDisposable
@@ -121,6 +121,32 @@ public class Store : IDisposable
             new { id, now = DateTime.UtcNow.ToString("o") });
     }
 
+    // ── API Key Resolution ──
+
+    public Project? ResolveApiKey(string apiKey)
+    {
+        if (string.IsNullOrEmpty(apiKey)) return null;
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
+        using var conn = Open();
+        return conn.QueryFirstOrDefault<Project>(
+            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
+            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
+            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt " +
+            "FROM projects WHERE api_key_hash = @hash AND is_active = 1", new { hash });
+    }
+
+    public Project? ResolveApiKeyIncludingInactive(string apiKey)
+    {
+        if (string.IsNullOrEmpty(apiKey)) return null;
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
+        using var conn = Open();
+        return conn.QueryFirstOrDefault<Project>(
+            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
+            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
+            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt " +
+            "FROM projects WHERE api_key_hash = @hash", new { hash });
+    }
+
     // ── Pricing ──
 
     public List<ModelPricing> GetAllPricing()
@@ -148,7 +174,7 @@ public class Store : IDisposable
 
     // ── Request Log ──
 
-    public void LogRequest(string projectId, string userId, string timestamp,
+    public void LogRequest(string projectId, string? userId, string timestamp,
         string model, string deployment, string endpoint,
         int promptTokens, int completionTokens, double costUsd, int statusCode,
         int overheadMs, int upstreamMs, int transferMs, int totalMs,
@@ -190,7 +216,7 @@ public class Store : IDisposable
 
     // ── Usage Daily ──
 
-    public void UpsertUsageDaily(string projectId, string userId, string date,
+    public void UpsertUsageDaily(string projectId, string? userId, string date,
         double cost, int promptTokens, int completionTokens)
     {
         using var conn = Open();

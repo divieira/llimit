@@ -3,6 +3,11 @@ using System.Text.Json;
 
 namespace LLimit;
 
+public record BudgetDeny(string Scope, double Budget, double Used)
+{
+    public string Error { get; } = "budget_exceeded";
+}
+
 public static class ProxyHandler
 {
     public static void MapProxy(this WebApplication app)
@@ -11,18 +16,18 @@ public static class ProxyHandler
     }
 
     private static async Task HandleProxy(HttpContext ctx, string deployment, string rest,
-        AuthCache auth, PricingCache pricing, Store store,
+        Store store, PricingTable pricing,
         IHttpClientFactory factory, IConfiguration cfg, ILogger<Program> logger)
     {
         var sw = Stopwatch.StartNew();
 
         // ── Auth ──
         var apiKey = ctx.Request.Headers["api-key"].FirstOrDefault() ?? "";
-        var proj = auth.Resolve(apiKey);
+        var proj = store.ResolveApiKey(apiKey);
         if (proj is null)
         {
             // Check if key exists but project is inactive
-            var inactive = auth.ResolveIncludingInactive(apiKey);
+            var inactive = store.ResolveApiKeyIncludingInactive(apiKey);
             if (inactive is not null)
             {
                 ctx.Response.StatusCode = 403;
@@ -60,6 +65,9 @@ public static class ProxyHandler
         }
 
         // ── Read body, inject stream_options ──
+        // For streaming chat completions, Azure OpenAI only includes token usage in the
+        // final SSE chunk when stream_options.include_usage is set to true.
+        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
         using var ms = new MemoryStream();
         await ctx.Request.Body.CopyToAsync(ms);
         var bodyBytes = ms.ToArray();
@@ -150,7 +158,7 @@ public static class ProxyHandler
 
     private static async Task HandleBuffer(HttpContext ctx, HttpResponseMessage resp,
         Project proj, string? uid, string deployment, string endpoint,
-        PricingCache pricing, Store store, ILogger logger,
+        PricingTable pricing, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
         var body = await resp.Content.ReadAsByteArrayAsync();
@@ -180,12 +188,11 @@ public static class ProxyHandler
                 }
                 catch { }
 
-                var (cost, found) = pricing.Calculate(model, pt, ct);
+                var cost = pricing.Calculate(model, pt, ct);
                 var now = DateTime.UtcNow;
-                var dbUid = uid ?? "_anonymous";
-                store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, false, !found);
-                store.UpsertUsageDaily(proj.Id, dbUid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
+                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
+                    pt, ct, cost ?? 0, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, false, cost is null);
+                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost ?? 0, pt, ct);
             }
             catch (Exception ex)
             {
@@ -197,12 +204,16 @@ public static class ProxyHandler
 
     private static async Task HandleStream(HttpContext ctx, HttpResponseMessage resp,
         Project proj, string? uid, string deployment, string endpoint,
-        PricingCache pricing, Store store, ILogger logger,
+        PricingTable pricing, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
         var model = "";
         int pt = 0, ct = 0;
 
+        // Azure OpenAI streams responses as Server-Sent Events (SSE). Each event is
+        // prefixed with "data: " and the stream ends with "data: [DONE]".
+        // The final usage-only chunk has an empty choices array.
+        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
         using var reader = new StreamReader(await resp.Content.ReadAsStreamAsync());
         string? line;
         while ((line = await reader.ReadLineAsync()) is not null)
@@ -237,12 +248,11 @@ public static class ProxyHandler
         {
             try
             {
-                var (cost, found) = pricing.Calculate(model, pt, ct);
+                var cost = pricing.Calculate(model, pt, ct);
                 var now = DateTime.UtcNow;
-                var dbUid = uid ?? "_anonymous";
-                store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, true, !found);
-                store.UpsertUsageDaily(proj.Id, dbUid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
+                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
+                    pt, ct, cost ?? 0, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, true, cost is null);
+                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost ?? 0, pt, ct);
             }
             catch (Exception ex)
             {

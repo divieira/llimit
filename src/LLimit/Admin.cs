@@ -71,7 +71,7 @@ public static class AdminRoutes
         return Results.Ok(result);
     }
 
-    private static IResult CreateProject(CreateProjectRequest req, Store store, AuthCache authCache)
+    private static IResult CreateProject(CreateProjectRequest req, Store store)
     {
         if (string.IsNullOrWhiteSpace(req.Id) || string.IsNullOrWhiteSpace(req.Name))
             return Results.BadRequest(new { error = "id and name are required" });
@@ -80,8 +80,6 @@ public static class AdminRoutes
         {
             var (project, plainKey) = store.CreateProject(req.Id, req.Name,
                 req.BudgetDaily, req.DefaultUserBudgetDaily);
-
-            authCache.Reload(store.GetAllProjects());
 
             return Results.Created($"/api/v1/projects/{project.Id}", new
             {
@@ -112,24 +110,21 @@ public static class AdminRoutes
         });
     }
 
-    private static IResult UpdateProject(string id, UpdateProjectRequest req, Store store, AuthCache authCache)
+    private static IResult UpdateProject(string id, UpdateProjectRequest req, Store store)
     {
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
         store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive);
-
-        authCache.Reload(store.GetAllProjects());
         return Results.Ok(store.GetProject(id));
     }
 
-    private static IResult DeleteProject(string id, Store store, AuthCache authCache)
+    private static IResult DeleteProject(string id, Store store)
     {
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
         store.DeactivateProject(id);
-        authCache.Reload(store.GetAllProjects());
         return Results.Ok(new { message = "project deactivated" });
     }
 
@@ -166,11 +161,11 @@ public static class AdminRoutes
 
     // ── Pricing ──
 
-    private static IResult GetPricing(Store store, PricingCache pricingCache)
+    private static IResult GetPricing(Store store, PricingTable pricing)
     {
         var adminOverrides = store.GetAllPricing();
         var adminSet = new HashSet<string>(adminOverrides.Select(o => o.ModelPattern), StringComparer.OrdinalIgnoreCase);
-        var allPrices = pricingCache.GetAllPrices();
+        var allPrices = pricing.GetAllPrices();
 
         var result = allPrices.Select(kv => new
         {
@@ -183,33 +178,33 @@ public static class AdminRoutes
         return Results.Ok(result);
     }
 
-    private static IResult UpsertPricing(string modelPattern, UpsertPricingRequest req, Store store, PricingCache pricingCache)
+    private static IResult UpsertPricing(string modelPattern, UpsertPricingRequest req, Store store, PricingTable pricing)
     {
         store.UpsertPricing(modelPattern, req.InputPerMillion, req.OutputPerMillion);
-        pricingCache.ApplyAdminOverrides(store);
+        pricing.ApplyAdminOverrides(store);
         return Results.Ok(new { message = "pricing updated", modelPattern });
     }
 
-    private static async Task<IResult> DeletePricing(string modelPattern, Store store, PricingCache pricingCache, IHttpClientFactory factory)
+    private static async Task<IResult> DeletePricing(string modelPattern, Store store, PricingTable pricing, IHttpClientFactory factory)
     {
         store.DeletePricing(modelPattern);
         // Reload full pricing to remove the override and revert to LiteLLM
         try
         {
             using var http = factory.CreateClient();
-            await pricingCache.LoadFromLiteLlmAsync(http, store);
+            await pricing.LoadFromLiteLlmAsync(http, store);
         }
         catch (Exception)
         {
             // LiteLLM fetch failed — at least re-apply overrides from DB to remove the deleted one
-            pricingCache.ApplyAdminOverrides(store);
+            pricing.ApplyAdminOverrides(store);
         }
         return Results.Ok(new { message = "pricing override removed, reverting to LiteLLM", modelPattern });
     }
 
     // ── Diagnostics ──
 
-    private static IResult GetDiagnostics(PricingCache pricingCache)
+    private static IResult GetDiagnostics(PricingTable pricing)
     {
         return Results.Ok(new
         {
@@ -217,7 +212,7 @@ public static class AdminRoutes
             unknown_model_hits = Diagnostics.UnknownModelHits,
             async_failures = Diagnostics.AsyncFailures,
             pricing_refresh_failures = Diagnostics.PricingRefreshFailures,
-            pricing_last_refreshed = pricingCache.LastRefreshed.ToString("o"),
+            pricing_last_refreshed = pricing.LastRefreshed.ToString("o"),
             pricing_source = "litellm",
             uptime_seconds = (long)(DateTime.UtcNow - Diagnostics.StartedAt).TotalSeconds
         });

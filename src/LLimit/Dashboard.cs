@@ -88,7 +88,7 @@ public static class DashboardRoutes
 
     // ── Overview ──
 
-    private static IResult Overview(Store store, PricingCache pricingCache)
+    private static IResult Overview(Store store, PricingTable pricingCache)
     {
         var projects = store.GetAllProjects();
         var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
@@ -488,7 +488,7 @@ public static class DashboardRoutes
         return Results.Content(html, "text/html");
     }
 
-    private static IResult SaveProjectSettings(string id, HttpContext ctx, Store store, AuthCache authCache)
+    private static IResult SaveProjectSettings(string id, HttpContext ctx, Store store)
     {
         var project = store.GetProject(id);
         if (project is null) return Results.Content(Layout("Not Found", "<main class=\"container\"><h2>Project not found</h2></main>"), "text/html");
@@ -502,14 +502,12 @@ public static class DashboardRoutes
         store.UpdateProject(id, name, budgetDaily, defaultUserBudgetDaily, isActive,
             clearBudgets: true);
 
-        authCache.Reload(store.GetAllProjects());
-
         return Results.Redirect($"/dashboard/projects/{WebUtility.UrlEncode(id)}/settings?saved=1");
     }
 
     // ── Pricing Page ──
 
-    private static IResult PricingPage(Store store, PricingCache pricingCache)
+    private static IResult PricingPage(Store store, PricingTable pricingCache)
     {
         var allPrices = pricingCache.GetAllPrices();
         var adminOverrides = store.GetAllPricing();

@@ -11,8 +11,7 @@ builder.Services.AddSingleton(sp =>
     var dbPath = builder.Configuration["LLIMIT_DB_PATH"] ?? "llimit.db";
     return new Store(dbPath);
 });
-builder.Services.AddSingleton<AuthCache>();
-builder.Services.AddSingleton<PricingCache>();
+builder.Services.AddSingleton<PricingTable>();
 builder.Services.AddHttpClient("Azure", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(5);
@@ -21,16 +20,10 @@ builder.Services.AddHttpClient(); // default client for LiteLLM fetch
 
 var app = builder.Build();
 
-// ── Startup: load caches ──
+// ── Startup: validate config ──
 var store = app.Services.GetRequiredService<Store>();
-var authCache = app.Services.GetRequiredService<AuthCache>();
-var pricingCache = app.Services.GetRequiredService<PricingCache>();
+var pricingTable = app.Services.GetRequiredService<PricingTable>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
-
-// Load projects into auth cache
-var allProjects = store.GetAllProjects();
-authCache.Reload(allProjects);
-logger.LogInformation("Loaded {Count} projects into auth cache", allProjects.Count);
 
 // Validate required Azure configuration — fail fast on startup
 var azureEndpoint = builder.Configuration["AZURE_OPENAI_ENDPOINT"]
@@ -44,7 +37,7 @@ var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
 try
 {
     using var httpClient = httpFactory.CreateClient();
-    pricingCache.LoadFromLiteLlmAsync(httpClient, store).GetAwaiter().GetResult();
+    pricingTable.LoadFromLiteLlmAsync(httpClient, store).GetAwaiter().GetResult();
     logger.LogInformation("Pricing loaded from LiteLLM");
 }
 catch (Exception ex)
@@ -66,7 +59,7 @@ _ = Task.Run(async () =>
         try
         {
             using var http = httpFactory.CreateClient();
-            await pricingCache.LoadFromLiteLlmAsync(http, store);
+            await pricingTable.LoadFromLiteLlmAsync(http, store);
             logger.LogInformation("Pricing refreshed from LiteLLM");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

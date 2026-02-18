@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 CREATE TABLE IF NOT EXISTS request_log (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id          TEXT NOT NULL,
-    user_id             TEXT NOT NULL DEFAULT '_anonymous',
+    user_id             TEXT,
     timestamp           TEXT NOT NULL,
     model               TEXT NOT NULL,
     deployment          TEXT NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS request_log (
 
 CREATE TABLE IF NOT EXISTS usage_daily (
     project_id          TEXT NOT NULL,
-    user_id             TEXT NOT NULL DEFAULT '_anonymous',
+    user_id             TEXT,
     date                TEXT NOT NULL,
     total_cost          REAL NOT NULL DEFAULT 0.0,
     prompt_tokens       INTEGER NOT NULL DEFAULT 0,
