@@ -38,6 +38,13 @@ logger.LogInformation("Loaded {Count} projects into auth cache", allProjects.Cou
 budgetCache.LoadFromStore(store);
 logger.LogInformation("Budget cache loaded from DB");
 
+// Validate required Azure configuration — fail fast on startup
+var azureEndpoint = builder.Configuration["AZURE_OPENAI_ENDPOINT"]
+    ?? throw new InvalidOperationException("AZURE_OPENAI_ENDPOINT environment variable is required");
+var azureApiKey = builder.Configuration["AZURE_OPENAI_API_KEY"]
+    ?? throw new InvalidOperationException("AZURE_OPENAI_API_KEY environment variable is required");
+logger.LogInformation("Azure OpenAI endpoint configured: {Endpoint}", azureEndpoint);
+
 // Load pricing from LiteLLM
 var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
 try
@@ -117,11 +124,13 @@ app.MapAdmin();
 app.MapDashboard();
 
 // ── Graceful shutdown ──
+// Wait for in-flight requests to complete. The cancellation token stops background timers,
+// and Kestrel's shutdown timeout (default 30s, configurable via ASPNETCORE_SHUTDOWNTIMEOUT)
+// handles draining active HTTP connections.
+// See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/host/generic-host#shutdowntimeout
 lifetime.ApplicationStopping.Register(() =>
 {
-    logger.LogInformation("Shutting down — flushing pending operations");
-    // Give in-flight Task.Run operations time to complete
-    Thread.Sleep(2000);
+    logger.LogInformation("Shutting down — waiting for in-flight requests to drain");
 });
 
 app.Run();

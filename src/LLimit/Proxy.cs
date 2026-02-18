@@ -34,7 +34,7 @@ public static class ProxyHandler
             return;
         }
 
-        var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault() ?? "_anonymous";
+        var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault();
 
         // ── Budget check (pure in-memory, zero DB) ──
         var deny = budget.CheckAll(proj, uid);
@@ -78,9 +78,9 @@ public static class ProxyHandler
             // Not JSON or malformed — forward as-is
         }
 
-        // ── Forward to Azure ──
-        var azureEndpoint = cfg["AZURE_OPENAI_ENDPOINT"] ?? throw new InvalidOperationException("AZURE_OPENAI_ENDPOINT not configured");
-        var azureKey = cfg["AZURE_OPENAI_API_KEY"] ?? throw new InvalidOperationException("AZURE_OPENAI_API_KEY not configured");
+        // ── Forward to Azure (validated at startup, guaranteed non-null) ──
+        var azureEndpoint = cfg["AZURE_OPENAI_ENDPOINT"]!;
+        var azureKey = cfg["AZURE_OPENAI_API_KEY"]!;
         var url = $"{azureEndpoint.TrimEnd('/')}/openai/deployments/{deployment}/{rest}{ctx.Request.QueryString}";
 
         var client = factory.CreateClient("Azure");
@@ -91,6 +91,9 @@ public static class ProxyHandler
 
         var overheadMs = (int)sw.ElapsedMilliseconds; // t1 - t0
 
+        // For streaming responses, start processing as soon as headers arrive rather than
+        // buffering the entire body. This enables SSE pass-through with minimal latency.
+        // See: https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption
         var completionOption = isStream
             ? HttpCompletionOption.ResponseHeadersRead
             : HttpCompletionOption.ResponseContentRead;
@@ -111,6 +114,9 @@ public static class ProxyHandler
         var upstreamMs = (int)sw.ElapsedMilliseconds - overheadMs; // t2 - t1
 
         // ── Copy response headers ──
+        // Skip transfer-encoding: Kestrel manages its own chunked encoding when writing
+        // to the response body. Forwarding the upstream's "chunked" header causes a
+        // double-encoding conflict. See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel/request-draining
         ctx.Response.StatusCode = (int)resp.StatusCode;
         foreach (var h in resp.Headers.Concat(resp.Content.Headers))
         {
@@ -132,7 +138,7 @@ public static class ProxyHandler
     }
 
     private static async Task HandleBuffer(HttpContext ctx, HttpResponseMessage resp,
-        Project proj, string uid, string deployment, string endpoint,
+        Project proj, string? uid, string deployment, string endpoint,
         PricingCache pricing, BudgetCache budget, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
@@ -163,12 +169,13 @@ public static class ProxyHandler
                 }
                 catch { }
 
-                var (cost, fallback) = pricing.Calculate(model, pt, ct);
+                var (cost, found) = pricing.Calculate(model, pt, ct);
                 budget.Add(proj.Id, uid, cost);
                 var now = DateTime.UtcNow;
-                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, false, fallback);
-                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
+                var dbUid = uid ?? "_anonymous";
+                store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,
+                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, false, !found);
+                store.UpsertUsageDaily(proj.Id, dbUid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
             }
             catch (Exception ex)
             {
@@ -179,7 +186,7 @@ public static class ProxyHandler
     }
 
     private static async Task HandleStream(HttpContext ctx, HttpResponseMessage resp,
-        Project proj, string uid, string deployment, string endpoint,
+        Project proj, string? uid, string deployment, string endpoint,
         PricingCache pricing, BudgetCache budget, Store store, ILogger logger,
         Stopwatch sw, int overheadMs, int upstreamMs)
     {
@@ -220,12 +227,13 @@ public static class ProxyHandler
         {
             try
             {
-                var (cost, fallback) = pricing.Calculate(model, pt, ct);
+                var (cost, found) = pricing.Calculate(model, pt, ct);
                 budget.Add(proj.Id, uid, cost);
                 var now = DateTime.UtcNow;
-                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, true, fallback);
-                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
+                var dbUid = uid ?? "_anonymous";
+                store.LogRequest(proj.Id, dbUid, now.ToString("o"), model, deployment, endpoint,
+                    pt, ct, cost, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, true, !found);
+                store.UpsertUsageDaily(proj.Id, dbUid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost, pt, ct);
             }
             catch (Exception ex)
             {

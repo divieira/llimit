@@ -1,3 +1,7 @@
+# Multi-stage build for LLimit LLM cost gateway.
+# Build stage uses .NET SDK, runtime uses minimal ASP.NET image.
+# SQLite database is stored in /data (mount a volume in production).
+# See: https://learn.microsoft.com/en-us/dotnet/core/docker/build-container
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 COPY src/LLimit/LLimit.csproj ./
