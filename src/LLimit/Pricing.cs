@@ -33,14 +33,22 @@ public class PricingTable
         return null;
     }
 
+    /// <summary>
+    /// Returns true if the given model has pricing data.
+    /// </summary>
+    public bool HasPricing(string model) => _prices.ContainsKey(model);
+
+    /// <summary>
+    /// Fetches pricing from LiteLLM, applies admin overrides, and saves to DB for fallback.
+    /// </summary>
     public async Task LoadFromLiteLlmAsync(HttpClient http, Store store)
     {
-        var dict = new Dictionary<string, ModelPrice>(StringComparer.OrdinalIgnoreCase);
-
-        // Fetch LiteLLM pricing
+        // Fetch pricing from LiteLLM's public model pricing JSON.
+        // See: https://github.com/BerriAI/litellm
         var json = await http.GetStringAsync(
             "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json");
 
+        var litellmPrices = new Dictionary<string, ModelPrice>(StringComparer.OrdinalIgnoreCase);
         using var doc = JsonDocument.Parse(json);
         foreach (var prop in doc.RootElement.EnumerateObject())
         {
@@ -50,28 +58,34 @@ public class PricingTable
             if (!prop.Value.TryGetProperty("input_cost_per_token", out var inputCost)) continue;
             if (!prop.Value.TryGetProperty("output_cost_per_token", out var outputCost)) continue;
 
-            // Strip "azure/" prefix
+            // Strip "azure/" prefix to match the model names Azure returns in responses
             var modelName = prop.Name;
             if (modelName.StartsWith("azure/", StringComparison.OrdinalIgnoreCase))
                 modelName = modelName[6..];
 
-            dict[modelName] = new ModelPrice(inputCost.GetDouble(), outputCost.GetDouble());
+            litellmPrices[modelName] = new ModelPrice(inputCost.GetDouble(), outputCost.GetDouble());
         }
 
-        _logger.LogInformation("Loaded {Count} Azure model prices from LiteLLM", dict.Count);
+        _logger.LogInformation("Loaded {Count} Azure model prices from LiteLLM", litellmPrices.Count);
+
+        // Save to DB so we have a fallback if LiteLLM is unreachable next time
+        store.SaveLiteLlmPrices(litellmPrices);
 
         // Admin overrides win
-        var overrides = store.GetAllPricing();
-        foreach (var o in overrides)
-        {
-            dict[o.ModelPattern] = new ModelPrice(o.InputPerMillion / 1_000_000, o.OutputPerMillion / 1_000_000);
-        }
+        ApplyOverridesAndSwap(litellmPrices, store);
+    }
 
-        if (overrides.Count > 0)
-            _logger.LogInformation("Applied {Count} admin pricing overrides", overrides.Count);
+    /// <summary>
+    /// Loads cached LiteLLM prices from DB (fallback when online fetch fails).
+    /// </summary>
+    public void LoadFromDbFallback(Store store)
+    {
+        var cached = store.LoadLiteLlmPrices();
+        if (cached.Count == 0)
+            throw new InvalidOperationException("No cached LiteLLM prices in DB — cannot start without pricing data");
 
-        _prices = dict;
-        _lastRefreshed = DateTime.UtcNow;
+        _logger.LogWarning("Using {Count} cached LiteLLM prices from DB (online fetch failed)", cached.Count);
+        ApplyOverridesAndSwap(cached, store);
     }
 
     public void ApplyAdminOverrides(Store store)
@@ -86,6 +100,21 @@ public class PricingTable
     }
 
     public Dictionary<string, ModelPrice> GetAllPrices() => new(_prices);
+
+    private void ApplyOverridesAndSwap(Dictionary<string, ModelPrice> basePrices, Store store)
+    {
+        var overrides = store.GetAllPricing();
+        foreach (var o in overrides)
+        {
+            basePrices[o.ModelPattern] = new ModelPrice(o.InputPerMillion / 1_000_000, o.OutputPerMillion / 1_000_000);
+        }
+
+        if (overrides.Count > 0)
+            _logger.LogInformation("Applied {Count} admin pricing overrides", overrides.Count);
+
+        _prices = basePrices;
+        _lastRefreshed = DateTime.UtcNow;
+    }
 }
 
 // ── Diagnostics ──

@@ -60,7 +60,7 @@ public static class AdminRoutes
     private static IResult ListProjects(Store store)
     {
         var projects = store.GetAllProjects();
-        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var todayCosts = store.GetAllProjectCostsForDate(today);
         var result = projects.Select(p => new
         {
@@ -98,7 +98,7 @@ public static class AdminRoutes
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
-        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var todayCost = store.GetProjectCostForDate(id, today);
 
         return Results.Ok(new
@@ -146,7 +146,9 @@ public static class AdminRoutes
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
-        var usage = store.GetUsage(id, from, to);
+        var fromDate = from is not null && DateOnly.TryParse(from, out var fd) ? fd : (DateOnly?)null;
+        var toDate = to is not null && DateOnly.TryParse(to, out var td) ? td : (DateOnly?)null;
+        var usage = store.GetUsage(id, fromDate, toDate);
         return Results.Ok(usage);
     }
 

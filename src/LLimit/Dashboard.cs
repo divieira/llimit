@@ -91,7 +91,7 @@ public static class DashboardRoutes
     private static IResult Overview(Store store, PricingTable pricingCache)
     {
         var projects = store.GetAllProjects();
-        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var todayCosts = store.GetAllProjectCostsForDate(today);
 
         // Projects table rows
@@ -221,8 +221,8 @@ public static class DashboardRoutes
         var users = store.GetProjectUsers(id);
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var weekAgo = today.AddDays(-7);
-        var usage = store.GetUsage(id, weekAgo.ToString("yyyy-MM-dd"), today.ToString("yyyy-MM-dd"));
-        var todayCost = store.GetProjectCostForDate(id, today.ToString("yyyy-MM-dd"));
+        var usage = store.GetUsage(id, weekAgo, today);
+        var todayCost = store.GetProjectCostForDate(id, today);
 
         // Users table
         var userRows = "";
@@ -369,7 +369,6 @@ public static class DashboardRoutes
         var logRows = "";
         foreach (var log in logs)
         {
-            var fallbackBadge = log.UsedFallbackPricing ? "<span title=\"Fallback pricing used\" style=\"color:orange;\">~</span>" : "";
             var streamBadge = log.IsStream ? "SSE" : "Buf";
             logRows += $@"
 <tr>
@@ -379,7 +378,7 @@ public static class DashboardRoutes
   <td>{Enc(log.Deployment)}</td>
   <td>{log.PromptTokens}</td>
   <td>{log.CompletionTokens}</td>
-  <td>${log.CostUsd:F6}{fallbackBadge}</td>
+  <td>${log.CostUsd:F6}</td>
   <td>{log.StatusCode}</td>
   <td>{log.OverheadMs}</td>
   <td>{log.UpstreamMs}</td>

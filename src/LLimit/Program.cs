@@ -12,6 +12,8 @@ builder.Services.AddSingleton(sp =>
     return new Store(dbPath);
 });
 builder.Services.AddSingleton<PricingTable>();
+// Named "Azure" client with a 5-minute timeout for long-running LLM completions.
+// See: https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/http/httpclient-guidelines
 builder.Services.AddHttpClient("Azure", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(5);
@@ -32,7 +34,8 @@ var azureApiKey = builder.Configuration["AZURE_OPENAI_API_KEY"]
     ?? throw new InvalidOperationException("AZURE_OPENAI_API_KEY environment variable is required");
 logger.LogInformation("Azure OpenAI endpoint configured: {Endpoint}", azureEndpoint);
 
-// Load pricing from LiteLLM
+// Load pricing: try LiteLLM online, fall back to DB-cached prices.
+// On success, prices are saved to DB for next startup's fallback.
 var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
 try
 {
@@ -42,8 +45,9 @@ try
 }
 catch (Exception ex)
 {
-    logger.LogCritical(ex, "Failed to load pricing from LiteLLM — startup aborted");
-    throw;
+    logger.LogWarning(ex, "Failed to load pricing from LiteLLM — falling back to DB cache");
+    // Falls back to DB-cached prices; throws if no cache exists (first run with no network)
+    pricingTable.LoadFromDbFallback(store);
 }
 
 // ── Background tasks ──

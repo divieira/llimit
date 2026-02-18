@@ -26,7 +26,6 @@ public static class ProxyHandler
         var proj = store.ResolveApiKey(apiKey);
         if (proj is null)
         {
-            // Check if key exists but project is inactive
             var inactive = store.ResolveApiKeyIncludingInactive(apiKey);
             if (inactive is not null)
             {
@@ -41,8 +40,8 @@ public static class ProxyHandler
 
         var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault();
 
-        // ── Budget check (daily only, queries DB) ──
-        var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+        // ── Budget check (daily, queries DB directly) ──
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
         if (proj.BudgetDaily is { } projectLimit)
         {
             var used = store.GetProjectCostForDate(proj.Id, today);
@@ -64,40 +63,42 @@ public static class ProxyHandler
             }
         }
 
-        // ── Read body, inject stream_options ──
-        // For streaming chat completions, Azure OpenAI only includes token usage in the
-        // final SSE chunk when stream_options.include_usage is set to true.
-        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
+        // ── Parse request body ──
         using var ms = new MemoryStream();
         await ctx.Request.Body.CopyToAsync(ms);
         var bodyBytes = ms.ToArray();
         var isStream = false;
-        var endpoint = rest;
+        var requestModel = (string?)null;
 
         try
         {
             using var doc = JsonDocument.Parse(bodyBytes);
             isStream = doc.RootElement.TryGetProperty("stream", out var sv) && sv.GetBoolean();
 
-            if (isStream && !doc.RootElement.TryGetProperty("stream_options", out _))
-            {
-                using var buf = new MemoryStream();
-                using var writer = new Utf8JsonWriter(buf);
-                writer.WriteStartObject();
-                foreach (var p in doc.RootElement.EnumerateObject())
-                    p.WriteTo(writer);
-                writer.WritePropertyName("stream_options");
-                writer.WriteStartObject();
-                writer.WriteBoolean("include_usage", true);
-                writer.WriteEndObject();
-                writer.WriteEndObject();
-                writer.Flush();
-                bodyBytes = buf.ToArray();
-            }
+            // Extract model from request body if present (OpenAI SDK clients include it).
+            // Azure OpenAI ignores this field (deployment determines the model), but we use
+            // it for pre-validation when available.
+            if (doc.RootElement.TryGetProperty("model", out var mv))
+                requestModel = mv.GetString();
+
+            // Ensure stream_options.include_usage=true for streaming requests.
+            // Azure OpenAI only includes token usage in the final SSE chunk when this is set.
+            // For non-streaming requests, usage is always included in the response body.
+            // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
+            if (isStream)
+                bodyBytes = EnsureStreamIncludeUsage(doc, bodyBytes);
         }
         catch (JsonException)
         {
             // Not JSON or malformed — forward as-is
+        }
+
+        // ── Pre-validate model pricing (if model known from request) ──
+        if (requestModel is not null && !pricing.HasPricing(requestModel))
+        {
+            ctx.Response.StatusCode = 422;
+            await ctx.Response.WriteAsJsonAsync(new { error = "unknown_model", model = requestModel });
+            return;
         }
 
         // ── Forward to Azure (validated at startup, guaranteed non-null) ──
@@ -111,7 +112,7 @@ public static class ProxyHandler
         req.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
         req.Headers.Add("api-key", azureKey);
 
-        var overheadMs = (int)sw.ElapsedMilliseconds; // t1 - t0
+        var overheadMs = (int)sw.ElapsedMilliseconds;
 
         // For streaming responses, start processing as soon as headers arrive rather than
         // buffering the entire body. This enables SSE pass-through with minimal latency.
@@ -127,18 +128,19 @@ public static class ProxyHandler
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Failed to reach Azure for {Deployment}/{Endpoint}", deployment, endpoint);
+            logger.LogError(ex, "Failed to reach Azure for {Deployment}/{Endpoint}", deployment, rest);
             ctx.Response.StatusCode = 502;
             await ctx.Response.WriteAsJsonAsync(new { error = "upstream_error" });
             return;
         }
 
-        var upstreamMs = (int)sw.ElapsedMilliseconds - overheadMs; // t2 - t1
+        var upstreamMs = (int)sw.ElapsedMilliseconds - overheadMs;
 
         // ── Copy response headers ──
         // Skip transfer-encoding: Kestrel manages its own chunked encoding when writing
         // to the response body. Forwarding the upstream's "chunked" header causes a
-        // double-encoding conflict. See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel/request-draining
+        // double-encoding conflict.
+        // See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel
         ctx.Response.StatusCode = (int)resp.StatusCode;
         foreach (var h in resp.Headers.Concat(resp.Content.Headers))
         {
@@ -146,74 +148,76 @@ public static class ProxyHandler
             ctx.Response.Headers[h.Key] = h.Value.ToArray();
         }
 
-        // ── Stream or buffer response ──
+        // ── Forward response body and extract usage ──
+        // Both streaming and buffered paths forward the response to the client first,
+        // then extract usage. For streaming (SSE), data is forwarded line-by-line as it
+        // arrives; the final chunk with empty choices[] contains the usage summary.
+        // For buffered responses, the full body is sent then parsed.
+        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
+        string model;
+        int promptTokens, completionTokens;
+
         using (resp)
         {
             if (isStream)
-                await HandleStream(ctx, resp, proj, uid, deployment, endpoint, pricing, store, logger, sw, overheadMs, upstreamMs);
+                (model, promptTokens, completionTokens) = await ForwardStream(ctx, resp, logger);
             else
-                await HandleBuffer(ctx, resp, proj, uid, deployment, endpoint, pricing, store, logger, sw, overheadMs, upstreamMs);
+                (model, promptTokens, completionTokens) = await ForwardBuffered(ctx, resp, logger);
         }
-    }
-
-    private static async Task HandleBuffer(HttpContext ctx, HttpResponseMessage resp,
-        Project proj, string? uid, string deployment, string endpoint,
-        PricingTable pricing, Store store, ILogger logger,
-        Stopwatch sw, int overheadMs, int upstreamMs)
-    {
-        var body = await resp.Content.ReadAsByteArrayAsync();
-        await ctx.Response.Body.WriteAsync(body);
 
         var totalMs = (int)sw.ElapsedMilliseconds;
         var transferMs = totalMs - overheadMs - upstreamMs;
 
-        // Fire-and-forget: extract usage, calculate cost, log
+        // ── Calculate cost (synchronous — only DB write is async) ──
+        var cost = pricing.Calculate(model, promptTokens, completionTokens) ?? 0;
+
+        // Fire-and-forget: persist to DB only
         _ = Task.Run(() =>
         {
             try
             {
-                var model = "";
-                int pt = 0, ct = 0;
-
-                try
-                {
-                    using var doc = JsonDocument.Parse(body);
-                    if (doc.RootElement.TryGetProperty("model", out var mv))
-                        model = mv.GetString() ?? "";
-                    if (doc.RootElement.TryGetProperty("usage", out var usage))
-                    {
-                        pt = usage.GetProperty("prompt_tokens").GetInt32();
-                        ct = usage.GetProperty("completion_tokens").GetInt32();
-                    }
-                }
-                catch { }
-
-                var cost = pricing.Calculate(model, pt, ct);
                 var now = DateTime.UtcNow;
-                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost ?? 0, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, false, cost is null);
-                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost ?? 0, pt, ct);
+                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, rest,
+                    promptTokens, completionTokens, cost, (int)resp.StatusCode,
+                    overheadMs, upstreamMs, transferMs, totalMs, isStream);
+                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now), cost, promptTokens, completionTokens);
             }
             catch (Exception ex)
             {
                 Interlocked.Increment(ref Diagnostics.AsyncFailures);
-                logger.LogError(ex, "Async logging failed for {Project}/{Deployment}", proj.Id, deployment);
+                logger.LogError(ex, "Async DB write failed for {Project}/{Deployment}", proj.Id, deployment);
             }
         });
     }
 
-    private static async Task HandleStream(HttpContext ctx, HttpResponseMessage resp,
-        Project proj, string? uid, string deployment, string endpoint,
-        PricingTable pricing, Store store, ILogger logger,
-        Stopwatch sw, int overheadMs, int upstreamMs)
+    /// <summary>
+    /// Forwards a buffered (non-streaming) response to the client and extracts usage.
+    /// </summary>
+    private static async Task<(string model, int promptTokens, int completionTokens)> ForwardBuffered(
+        HttpContext ctx, HttpResponseMessage resp, ILogger logger)
+    {
+        var body = await resp.Content.ReadAsByteArrayAsync();
+        await ctx.Response.Body.WriteAsync(body);
+
+        // For non-streaming responses, Azure always includes usage in the response body.
+        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
+        return ExtractUsage(body, logger);
+    }
+
+    /// <summary>
+    /// Forwards an SSE streaming response line-by-line and extracts usage from the final chunk.
+    /// Azure OpenAI streams as Server-Sent Events: each event is "data: {json}\n\n",
+    /// the final usage chunk has choices=[] with a usage object, and the stream ends with
+    /// "data: [DONE]".
+    /// See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
+    /// </summary>
+    private static async Task<(string model, int promptTokens, int completionTokens)> ForwardStream(
+        HttpContext ctx, HttpResponseMessage resp, ILogger logger)
     {
         var model = "";
         int pt = 0, ct = 0;
+        byte[]? lastUsageChunk = null;
 
-        // Azure OpenAI streams responses as Server-Sent Events (SSE). Each event is
-        // prefixed with "data: " and the stream ends with "data: [DONE]".
-        // The final usage-only chunk has an empty choices array.
-        // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
         using var reader = new StreamReader(await resp.Content.ReadAsStreamAsync());
         string? line;
         while ((line = await reader.ReadLineAsync()) is not null)
@@ -221,44 +225,120 @@ public static class ProxyHandler
             await ctx.Response.WriteAsync(line + "\n");
             await ctx.Response.Body.FlushAsync();
 
-            if (line.StartsWith("data: ") && line != "data: [DONE]")
+            if (!line.StartsWith("data: ") || line == "data: [DONE]")
+                continue;
+
+            try
             {
-                try
+                using var chunk = JsonDocument.Parse(line.AsMemory(6));
+
+                if (chunk.RootElement.TryGetProperty("model", out var mv))
+                    model = mv.GetString() ?? model;
+
+                // The final chunk has choices=[] and contains the usage summary
+                if (chunk.RootElement.TryGetProperty("usage", out _)
+                    && chunk.RootElement.TryGetProperty("choices", out var choices)
+                    && choices.GetArrayLength() == 0)
                 {
-                    using var chunk = JsonDocument.Parse(line.AsMemory(6));
-                    if (chunk.RootElement.TryGetProperty("model", out var mv))
-                        model = mv.GetString() ?? model;
-                    if (chunk.RootElement.TryGetProperty("usage", out var usage)
-                        && chunk.RootElement.TryGetProperty("choices", out var choices)
-                        && choices.GetArrayLength() == 0)
-                    {
-                        pt = usage.GetProperty("prompt_tokens").GetInt32();
-                        ct = usage.GetProperty("completion_tokens").GetInt32();
-                    }
+                    lastUsageChunk = System.Text.Encoding.UTF8.GetBytes(line[6..]);
                 }
-                catch (JsonException) { }
+            }
+            catch (JsonException) { }
+        }
+
+        // Extract usage from the final chunk using the shared extraction method
+        if (lastUsageChunk is not null)
+        {
+            (model, pt, ct) = ExtractUsage(lastUsageChunk, logger);
+        }
+        else
+        {
+            logger.LogWarning("No usage chunk found in SSE stream — model={Model}", model);
+        }
+
+        return (model, pt, ct);
+    }
+
+    /// <summary>
+    /// Parses a JSON response body to extract model name and token usage.
+    /// Throws if the usage property is missing (Azure always includes it when
+    /// stream_options.include_usage=true or for non-streaming responses).
+    /// </summary>
+    private static (string model, int promptTokens, int completionTokens) ExtractUsage(
+        byte[] jsonBody, ILogger logger)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(jsonBody);
+            var model = doc.RootElement.TryGetProperty("model", out var mv)
+                ? mv.GetString() ?? ""
+                : "";
+
+            // Don't TryGet — usage must be present. Azure includes it in all non-streaming
+            // responses and in the final streaming chunk when include_usage=true.
+            var usage = doc.RootElement.GetProperty("usage");
+            var pt = usage.GetProperty("prompt_tokens").GetInt32();
+            var ct = usage.GetProperty("completion_tokens").GetInt32();
+            return (model, pt, ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to extract usage from response body");
+            return ("", 0, 0);
+        }
+    }
+
+    /// <summary>
+    /// Ensures stream_options.include_usage=true is set in the request JSON.
+    /// If stream_options is absent, adds it. If present without include_usage, adds the property.
+    /// </summary>
+    private static byte[] EnsureStreamIncludeUsage(JsonDocument doc, byte[] original)
+    {
+        // Check if include_usage is already set
+        if (doc.RootElement.TryGetProperty("stream_options", out var so)
+            && so.TryGetProperty("include_usage", out var iu)
+            && iu.GetBoolean())
+        {
+            return original; // Already configured correctly
+        }
+
+        // Rewrite the JSON with stream_options.include_usage=true
+        using var buf = new MemoryStream();
+        using var writer = new Utf8JsonWriter(buf);
+        writer.WriteStartObject();
+
+        foreach (var p in doc.RootElement.EnumerateObject())
+        {
+            if (p.Name == "stream_options")
+            {
+                // Rewrite stream_options with include_usage=true added/overridden
+                writer.WritePropertyName("stream_options");
+                writer.WriteStartObject();
+                foreach (var sp in p.Value.EnumerateObject())
+                {
+                    if (sp.Name != "include_usage")
+                        sp.WriteTo(writer);
+                }
+                writer.WriteBoolean("include_usage", true);
+                writer.WriteEndObject();
+            }
+            else
+            {
+                p.WriteTo(writer);
             }
         }
 
-        var totalMs = (int)sw.ElapsedMilliseconds;
-        var transferMs = totalMs - overheadMs - upstreamMs;
-
-        // Fire-and-forget: cost + log
-        _ = Task.Run(() =>
+        // If stream_options wasn't present at all, add it
+        if (!doc.RootElement.TryGetProperty("stream_options", out _))
         {
-            try
-            {
-                var cost = pricing.Calculate(model, pt, ct);
-                var now = DateTime.UtcNow;
-                store.LogRequest(proj.Id, uid, now.ToString("o"), model, deployment, endpoint,
-                    pt, ct, cost ?? 0, (int)resp.StatusCode, overheadMs, upstreamMs, transferMs, totalMs, true, cost is null);
-                store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now).ToString("yyyy-MM-dd"), cost ?? 0, pt, ct);
-            }
-            catch (Exception ex)
-            {
-                Interlocked.Increment(ref Diagnostics.AsyncFailures);
-                logger.LogError(ex, "Async logging failed for {Project}/{Deployment}", proj.Id, deployment);
-            }
-        });
+            writer.WritePropertyName("stream_options");
+            writer.WriteStartObject();
+            writer.WriteBoolean("include_usage", true);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndObject();
+        writer.Flush();
+        return buf.ToArray();
     }
 }

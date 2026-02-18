@@ -18,7 +18,7 @@ public record RequestLogEntry(
     int PromptTokens, int CompletionTokens, int TotalTokens,
     double CostUsd, int StatusCode,
     int OverheadMs, int UpstreamMs, int TransferMs, int TotalMs,
-    bool IsStream, bool UsedFallbackPricing);
+    bool IsStream);
 
 public record UsageDaily(string ProjectId, string? UserId, string Date,
     double TotalCost, int PromptTokens, int CompletionTokens, int RequestCount);
@@ -43,8 +43,14 @@ public class Store : IDisposable
     private void Init()
     {
         using var conn = Open();
+        // WAL mode allows concurrent reads during writes.
+        // See: https://www.sqlite.org/wal.html
         conn.Execute("PRAGMA journal_mode=WAL");
+        // NORMAL sync is safe with WAL — only loses data on OS crash, not app crash.
+        // See: https://www.sqlite.org/pragma.html#pragma_synchronous
         conn.Execute("PRAGMA synchronous=NORMAL");
+        // Wait up to 5s for locks instead of failing immediately.
+        // See: https://www.sqlite.org/pragma.html#pragma_busy_timeout
         conn.Execute("PRAGMA busy_timeout=5000");
 
         var sql = GetMigrationSql();
@@ -53,6 +59,8 @@ public class Store : IDisposable
 
     private static string GetMigrationSql()
     {
+        // SQL migrations are embedded in the assembly to ship as a single binary.
+        // See: https://learn.microsoft.com/en-us/dotnet/core/extensions/resources
         var asm = typeof(Store).Assembly;
         using var stream = asm.GetManifestResourceStream("LLimit.Migrations.001_initial.sql")
             ?? throw new InvalidOperationException("Migration SQL not found as embedded resource");
@@ -172,28 +180,55 @@ public class Store : IDisposable
         conn.Execute("DELETE FROM model_pricing WHERE model_pattern = @modelPattern", new { modelPattern });
     }
 
+    // ── LiteLLM Price Cache (DB fallback) ──
+
+    public void SaveLiteLlmPrices(Dictionary<string, ModelPrice> prices)
+    {
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        conn.Execute("DELETE FROM litellm_prices", transaction: tx);
+        var now = DateTime.UtcNow.ToString("o");
+        foreach (var kv in prices)
+        {
+            conn.Execute(
+                "INSERT INTO litellm_prices (model, input_per_token, output_per_token, fetched_at) " +
+                "VALUES (@model, @input, @output, @now)",
+                new { model = kv.Key, input = kv.Value.InputPerToken, output = kv.Value.OutputPerToken, now },
+                transaction: tx);
+        }
+        tx.Commit();
+    }
+
+    public Dictionary<string, ModelPrice> LoadLiteLlmPrices()
+    {
+        using var conn = Open();
+        return conn.Query<(string Model, double InputPerToken, double OutputPerToken)>(
+            "SELECT model, input_per_token AS InputPerToken, output_per_token AS OutputPerToken FROM litellm_prices")
+            .ToDictionary(r => r.Model, r => new ModelPrice(r.InputPerToken, r.OutputPerToken), StringComparer.OrdinalIgnoreCase);
+    }
+
     // ── Request Log ──
 
     public void LogRequest(string projectId, string? userId, string timestamp,
         string model, string deployment, string endpoint,
         int promptTokens, int completionTokens, double costUsd, int statusCode,
         int overheadMs, int upstreamMs, int transferMs, int totalMs,
-        bool isStream, bool usedFallbackPricing)
+        bool isStream)
     {
         using var conn = Open();
         conn.Execute(
             "INSERT INTO request_log (project_id, user_id, timestamp, model, deployment, endpoint, " +
             "prompt_tokens, completion_tokens, total_tokens, cost_usd, status_code, " +
-            "overhead_ms, upstream_ms, transfer_ms, total_ms, is_stream, used_fallback_pricing) " +
+            "overhead_ms, upstream_ms, transfer_ms, total_ms, is_stream) " +
             "VALUES (@projectId, @userId, @timestamp, @model, @deployment, @endpoint, " +
             "@promptTokens, @completionTokens, @totalTokens, @costUsd, @statusCode, " +
-            "@overheadMs, @upstreamMs, @transferMs, @totalMs, @isStream, @usedFallbackPricing)",
+            "@overheadMs, @upstreamMs, @transferMs, @totalMs, @isStream)",
             new
             {
                 projectId, userId, timestamp, model, deployment, endpoint,
                 promptTokens, completionTokens, totalTokens = promptTokens + completionTokens,
                 costUsd, statusCode, overheadMs, upstreamMs, transferMs, totalMs,
-                isStream, usedFallbackPricing
+                isStream
             });
     }
 
@@ -209,69 +244,75 @@ public class Store : IDisposable
             "prompt_tokens AS PromptTokens, completion_tokens AS CompletionTokens, total_tokens AS TotalTokens, " +
             "cost_usd AS CostUsd, status_code AS StatusCode, " +
             "overhead_ms AS OverheadMs, upstream_ms AS UpstreamMs, transfer_ms AS TransferMs, total_ms AS TotalMs, " +
-            "is_stream AS IsStream, used_fallback_pricing AS UsedFallbackPricing " +
+            "is_stream AS IsStream " +
             $"FROM request_log {where} ORDER BY id DESC LIMIT @perPage OFFSET @offset",
             new { projectId, userId, model, perPage, offset = (page - 1) * perPage }).AsList();
     }
 
     // ── Usage Daily ──
 
-    public void UpsertUsageDaily(string projectId, string? userId, string date,
+    public void UpsertUsageDaily(string projectId, string? userId, DateOnly date,
         double cost, int promptTokens, int completionTokens)
     {
+        var dateStr = date.ToString("yyyy-MM-dd");
         using var conn = Open();
         conn.Execute(
             "INSERT INTO usage_daily (project_id, user_id, date, total_cost, prompt_tokens, completion_tokens, request_count) " +
-            "VALUES (@projectId, @userId, @date, @cost, @promptTokens, @completionTokens, 1) " +
+            "VALUES (@projectId, @userId, @dateStr, @cost, @promptTokens, @completionTokens, 1) " +
             "ON CONFLICT(project_id, user_id, date) DO UPDATE SET " +
             "total_cost = total_cost + @cost, prompt_tokens = prompt_tokens + @promptTokens, " +
             "completion_tokens = completion_tokens + @completionTokens, request_count = request_count + 1",
-            new { projectId, userId, date, cost, promptTokens, completionTokens });
+            new { projectId, userId, dateStr, cost, promptTokens, completionTokens });
     }
 
-    public List<UsageDaily> GetUsage(string projectId, string? from = null, string? to = null)
+    public List<UsageDaily> GetUsage(string projectId, DateOnly? from = null, DateOnly? to = null)
     {
         using var conn = Open();
         var where = "WHERE project_id = @projectId";
-        if (from != null) where += " AND date >= @from";
-        if (to != null) where += " AND date <= @to";
+        var fromStr = from?.ToString("yyyy-MM-dd");
+        var toStr = to?.ToString("yyyy-MM-dd");
+        if (from != null) where += " AND date >= @fromStr";
+        if (to != null) where += " AND date <= @toStr";
 
         return conn.Query<UsageDaily>(
             "SELECT project_id AS ProjectId, user_id AS UserId, date, total_cost AS TotalCost, " +
             "prompt_tokens AS PromptTokens, completion_tokens AS CompletionTokens, request_count AS RequestCount " +
             $"FROM usage_daily {where} ORDER BY date DESC",
-            new { projectId, from, to }).AsList();
+            new { projectId, fromStr, toStr }).AsList();
     }
 
-    public Dictionary<string, double> GetAllProjectCostsForDate(string date)
+    public Dictionary<string, double> GetAllProjectCostsForDate(DateOnly date)
     {
+        var dateStr = date.ToString("yyyy-MM-dd");
         using var conn = Open();
         return conn.Query<(string ProjectId, double TotalCost)>(
-            "SELECT project_id AS ProjectId, COALESCE(SUM(total_cost), 0) AS TotalCost FROM usage_daily WHERE date = @date GROUP BY project_id",
-            new { date }).ToDictionary(x => x.ProjectId, x => x.TotalCost);
+            "SELECT project_id AS ProjectId, COALESCE(SUM(total_cost), 0) AS TotalCost FROM usage_daily WHERE date = @dateStr GROUP BY project_id",
+            new { dateStr }).ToDictionary(x => x.ProjectId, x => x.TotalCost);
     }
 
-    public double GetProjectCostForDate(string projectId, string date)
+    public double GetProjectCostForDate(string projectId, DateOnly date)
     {
+        var dateStr = date.ToString("yyyy-MM-dd");
         using var conn = Open();
         return conn.ExecuteScalar<double>(
-            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND date = @date",
-            new { projectId, date });
+            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND date = @dateStr",
+            new { projectId, dateStr });
     }
 
-    public double GetUserCostForDate(string projectId, string userId, string date)
+    public double GetUserCostForDate(string projectId, string userId, DateOnly date)
     {
+        var dateStr = date.ToString("yyyy-MM-dd");
         using var conn = Open();
         return conn.ExecuteScalar<double>(
-            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND user_id = @userId AND date = @date",
-            new { projectId, userId, date });
+            "SELECT COALESCE(SUM(total_cost), 0) FROM usage_daily WHERE project_id = @projectId AND user_id = @userId AND date = @dateStr",
+            new { projectId, userId, dateStr });
     }
 
-    public List<(string UserId, double TodayCost)> GetProjectUsers(string projectId)
+    public List<(string? UserId, double TodayCost)> GetProjectUsers(string projectId)
     {
         using var conn = Open();
         var today = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
-        return conn.Query<(string UserId, double TodayCost)>(
+        return conn.Query<(string? UserId, double TodayCost)>(
             "SELECT user_id AS UserId, COALESCE(SUM(CASE WHEN date = @today THEN total_cost ELSE 0 END), 0) AS TodayCost " +
             "FROM usage_daily WHERE project_id = @projectId GROUP BY user_id ORDER BY TodayCost DESC",
             new { projectId, today }).AsList();

@@ -8,7 +8,7 @@ llimit is a lightweight reverse-proxy in front of Azure OpenAI that:
 - Enforces **daily** budget limits per project and per user
 - Issues one API key per project (callers use it instead of the real Azure key)
 - Provides a web dashboard, log viewer, and project settings UI
-- Fails loudly on unknown models (cost=$0, flagged) — no silent fallback pricing
+- Rejects requests for unknown models before forwarding (if model in request body)
 
 Key design constraints:
 - **Core must be as lean as possible** — proxy logic separate from calculation/budget
@@ -37,11 +37,14 @@ Client                      llimit                              Azure OpenAI
   │   api-key: <proj-key>     │                                      │
   │   X-LLimit-User: alice    │  (optional — null if absent)         │
   │                           │                                      │
-  │                           │──lookup project by key (in-memory)   │
+  │                           │──resolve project by key (DB query)   │
   │                           │──check daily budget (DB query)───┐   │
   │                           │                                  │   │
   │                           │  if over budget:                 │   │
   │<──429 budget exceeded─────│<─────────────────────────────────┘   │
+  │                           │                                      │
+  │                           │  if model in body & no pricing:      │
+  │<──422 unknown_model───────│                                      │
   │                           │                                      │
   │                           │  if ok:                              │
   │                           │  t1 = mark pre-forward               │
@@ -53,8 +56,8 @@ Client                      llimit                              Azure OpenAI
   │<──response body (stream)──│<──response body (stream)────────────│
   │                           │  t3 = last byte / response done      │
   │                           │                                      │
-  │                           │──async: extract usage from body      │
-  │                           │──async: calc cost (model→price)      │
+  │                           │──sync: extract usage from body       │
+  │                           │──sync: calc cost (model→price)       │
   │                           │──async: write to SQLite              │
   │                           │──async: on failure → log + increment │
   │                           │         Diagnostics.AsyncFailures    │
@@ -90,13 +93,10 @@ For **streaming**: `upstream_ms` is TTFB (~200ms), `transfer_ms` is the SSE stre
 ┌──────────────────────────────────────────────────────────────────┐
 │                   In-Memory State                                │
 │                                                                  │
-│  AuthCache                                                       │
-│    Dictionary<string, Project>  // keyed by SHA-256(api-key)     │
-│    (volatile swap on reload)                                     │
-│                                                                  │
-│  PricingCache                                                    │
+│  PricingTable                                                    │
 │    volatile Dictionary<string, ModelPrice>                        │
-│    (loaded from DB overrides + LiteLLM, refreshed every 6h)     │
+│    (loaded from LiteLLM, DB fallback, refreshed every 6h)       │
+│    Admin overrides always win.                                   │
 │                                                                  │
 │  Diagnostics                                                     │
 │    ConcurrentDictionary<string, int> UnknownModels               │
@@ -105,6 +105,7 @@ For **streaming**: `upstream_ms` is TTFB (~200ms), `transfer_ms` is the SSE stre
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+API key resolution queries SQLite directly — no in-memory cache, no drift.
 Budget checks query `usage_daily` directly — no in-memory cache, no drift.
 
 ## Lazy Budget Enforcement
@@ -113,7 +114,7 @@ Budget checks query `usage_daily` directly — no in-memory cache, no drift.
 2. Response returns → calculate cost → write to `usage_daily`
 3. If that write pushes over budget → NEXT request gets blocked
 
-User is optional. If `X-LLimit-User` header is absent, `uid` is null — per-user limits are skipped. DB storage uses `"_anonymous"` as the default user ID.
+User is optional. If `X-LLimit-User` header is absent, `uid` is null — per-user limits are skipped.
 
 ## Cost Calculation — LiteLLM-Backed Pricing
 
@@ -121,9 +122,15 @@ User is optional. If `X-LLimit-User` header is absent, `uid` is null — per-use
 
 1. Admin override (DB `model_pricing` table) — always wins
 2. LiteLLM exact match (`"azure/{model}"`)
-3. Unknown → cost=$0, `used_fallback_pricing=1`, increment `Diagnostics.UnknownModels[model]`
+3. Unknown → cost=$0, increment `Diagnostics.UnknownModels[model]`, log warning
 
-On startup: fetch LiteLLM pricing (fail if unavailable). Every 6h: background refresh.
+**Pricing lifecycle:**
+- Startup: fetch from LiteLLM online → save to `litellm_prices` table → apply admin overrides
+- If LiteLLM fetch fails: load from `litellm_prices` DB cache (fallback)
+- Every 6h: background refresh from LiteLLM, save to DB on success
+
+**Pre-validation:** If the request body contains a `model` field (OpenAI SDK clients include it),
+the proxy checks pricing before forwarding. Unknown models get 422.
 
 ## Database Schema
 
@@ -139,17 +146,24 @@ CREATE TABLE projects (
     updated_at  TEXT NOT NULL
 );
 
-CREATE TABLE model_pricing (
+CREATE TABLE model_pricing (       -- admin overrides
     model_pattern       TEXT PRIMARY KEY,
     input_per_million   REAL NOT NULL,
     output_per_million  REAL NOT NULL,
     updated_at          TEXT NOT NULL
 );
 
+CREATE TABLE litellm_prices (      -- cached LiteLLM prices (fallback)
+    model               TEXT PRIMARY KEY,
+    input_per_token     REAL NOT NULL,
+    output_per_token    REAL NOT NULL,
+    fetched_at          TEXT NOT NULL
+);
+
 CREATE TABLE request_log (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id          TEXT NOT NULL,
-    user_id             TEXT NOT NULL DEFAULT '_anonymous',
+    user_id             TEXT,        -- null if no X-LLimit-User header
     timestamp           TEXT NOT NULL,
     model               TEXT NOT NULL,
     deployment          TEXT NOT NULL,
@@ -163,13 +177,12 @@ CREATE TABLE request_log (
     upstream_ms         INTEGER NOT NULL DEFAULT 0,
     transfer_ms         INTEGER NOT NULL DEFAULT 0,
     total_ms            INTEGER NOT NULL DEFAULT 0,
-    is_stream           INTEGER NOT NULL DEFAULT 0,
-    used_fallback_pricing INTEGER NOT NULL DEFAULT 0
+    is_stream           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE usage_daily (
     project_id          TEXT NOT NULL,
-    user_id             TEXT NOT NULL DEFAULT '_anonymous',
+    user_id             TEXT,        -- null if no X-LLimit-User header
     date                TEXT NOT NULL,
     total_cost          REAL NOT NULL DEFAULT 0.0,
     prompt_tokens       INTEGER NOT NULL DEFAULT 0,
@@ -222,26 +235,43 @@ GET /health → {"status": "ok"|"degraded", "db": "ok", "unknown_models": 0, "as
 
 ```
 LLimit/
-├── Program.cs          # Entry, DI, routing, config
-├── Proxy.cs            # Forward + stream + usage extraction + latency tracking
-├── Cache.cs            # AuthCache + PricingCache + Diagnostics
-├── Store.cs            # SQLite: open, migrate, CRUD, log, usage_daily, budget queries
+├── Program.cs          # Entry, DI, routing, startup validation, pricing load with fallback
+├── Proxy.cs            # Forward + stream + usage extraction + cost calc + latency tracking
+├── Pricing.cs          # PricingTable (LiteLLM + DB fallback + admin overrides) + Diagnostics
+├── Store.cs            # SQLite: open, migrate, CRUD, log, usage_daily, budget + key resolution
 ├── Admin.cs            # JSON API route handlers
-├── Dashboard.cs        # HTML page handlers
+├── Dashboard.cs        # HTML page handlers (PicoCSS + htmx)
 ├── wwwroot/style.css
 ├── Migrations/001_initial.sql
+├── Properties/launchSettings.json  # Local dev profile (port 5125, Development env)
 ├── LLimit.csproj
 ├── Dockerfile
-└── k8s/
+└── k8s/                # Deployment, Service, PVC with docs
 ```
+
+## Configuration
+
+| Variable                | Required | Description                                                     |
+|------------------------|----------|-----------------------------------------------------------------|
+| `AZURE_OPENAI_ENDPOINT`| Yes      | Azure OpenAI resource URL (`https://<resource>.openai.azure.com/`) |
+| `AZURE_OPENAI_API_KEY` | Yes      | Azure OpenAI API key                                            |
+| `LLIMIT_ADMIN_TOKEN`   | Yes      | Bearer token for admin API and dashboard login                  |
+| `LLIMIT_DB_PATH`       | No       | SQLite database path (default: `llimit.db`)                     |
+
+**Local development** uses `Properties/launchSettings.json` which sets `ASPNETCORE_ENVIRONMENT=Development`
+and listens on port 5125. See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/environments
 
 ## Key Decisions
 
 - **C# (.NET 8 Minimal API)** — 2 NuGet packages, everything else built-in
 - **Daily budgets only** — simple, no cache needed, direct DB queries
 - **User is optional** — null if absent, per-user limits skipped for anonymous requests
-- **LiteLLM pricing** — fetched on startup (fail if unavailable), refreshed every 6h, admin overrides win
-- **Exact match pricing** — no fuzzy/prefix matching, unknown models get cost=$0 + flag
+- **LiteLLM pricing with DB fallback** — fetched on startup, saved to DB; falls back to DB cache if fetch fails; refreshed every 6h
+- **Exact match pricing** — no fuzzy/prefix matching, unknown models get cost=$0 + diagnostics flag
+- **Pre-validate model** — if `model` field in request body, check pricing before forwarding (422 if unknown)
+- **Cost calc in request path** — pricing lookup is synchronous; only DB writes are fire-and-forget
+- **Usage extraction throws** — `GetProperty("usage")` instead of TryGet; log errors on failure
+- **No fallback pricing** — unknown models are flagged, not silently estimated
 - **Latency breakdown** — 4 columns: overhead, upstream TTFB, transfer, total
 - **Monitoring** — unknown model counter, async failure counter, exposed via diagnostics endpoint + health degradation
 - **SQLite** on single K8s replica with PVC and Recreate strategy
