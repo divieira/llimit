@@ -66,6 +66,8 @@ public static class AdminRoutes
         {
             p.Id, p.Name, p.IsActive,
             p.BudgetDaily, p.DefaultUserBudgetDaily,
+            p.EndpointUrl, p.AllowUserKeys,
+            HasEndpointKey = p.EndpointKey is not null,
             UsageToday = todayCosts.GetValueOrDefault(p.Id)
         });
         return Results.Ok(result);
@@ -79,12 +81,15 @@ public static class AdminRoutes
         try
         {
             var (project, plainKey) = store.CreateProject(req.Id, req.Name,
-                req.BudgetDaily, req.DefaultUserBudgetDaily);
+                req.BudgetDaily, req.DefaultUserBudgetDaily,
+                req.EndpointUrl, req.EndpointKey, req.AllowUserKeys ?? false);
 
             return Results.Created($"/api/v1/projects/{project.Id}", new
             {
                 project.Id, project.Name, ApiKey = plainKey,
-                project.BudgetDaily, project.DefaultUserBudgetDaily
+                project.BudgetDaily, project.DefaultUserBudgetDaily,
+                project.EndpointUrl, project.AllowUserKeys,
+                HasEndpointKey = project.EndpointKey is not null
             });
         }
         catch (Exception ex) when (ex.Message.Contains("UNIQUE"))
@@ -105,6 +110,8 @@ public static class AdminRoutes
         {
             project.Id, project.Name, project.IsActive,
             project.BudgetDaily, project.DefaultUserBudgetDaily,
+            project.EndpointUrl, project.AllowUserKeys,
+            HasEndpointKey = project.EndpointKey is not null,
             project.CreatedAt, project.UpdatedAt,
             UsageToday = todayCost
         });
@@ -115,7 +122,9 @@ public static class AdminRoutes
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
-        store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive);
+        store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive,
+            endpointUrl: req.EndpointUrl, endpointKey: req.EndpointKey, allowUserKeys: req.AllowUserKeys);
+
         return Results.Ok(store.GetProject(id));
     }
 
@@ -224,10 +233,14 @@ public static class AdminRoutes
 // ── Request DTOs ──
 
 public record CreateProjectRequest(string Id, string Name,
-    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null);
+    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null,
+    string? EndpointUrl = null, string? EndpointKey = null,
+    bool? AllowUserKeys = null);
 
 public record UpdateProjectRequest(string? Name = null,
     double? BudgetDaily = null, double? DefaultUserBudgetDaily = null,
-    bool? IsActive = null);
+    bool? IsActive = null,
+    string? EndpointUrl = null, string? EndpointKey = null,
+    bool? AllowUserKeys = null);
 
 public record UpsertPricingRequest(double InputPerMillion, double OutputPerMillion);

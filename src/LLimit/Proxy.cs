@@ -21,24 +21,51 @@ public static class ProxyHandler
     {
         var sw = Stopwatch.StartNew();
 
-        // ── Auth ──
+        // ── Auth: try project key first, then user key ──
         var apiKey = ctx.Request.Headers["api-key"].FirstOrDefault() ?? "";
-        var proj = store.ResolveApiKey(apiKey);
-        if (proj is null)
+
+        Project? proj;
+        string? uid;
+
+        var projectByKey = store.ResolveApiKey(apiKey);
+        if (projectByKey is not null)
         {
-            var inactive = store.ResolveApiKeyIncludingInactive(apiKey);
-            if (inactive is not null)
+            proj = projectByKey;
+            // Project-key callers identify themselves via the X-LLimit-User header (optional)
+            uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault();
+        }
+        else
+        {
+            // Try resolving as a personal user key
+            var userKey = store.ResolveUserApiKey(apiKey);
+            if (userKey is not null)
             {
-                ctx.Response.StatusCode = 403;
-                await ctx.Response.WriteAsJsonAsync(new { error = "project_deactivated" });
+                (proj, uid) = userKey.Value;
+            }
+            else
+            {
+                // Give a more specific error for deactivated-project keys
+                var inactiveProject = store.ResolveApiKeyIncludingInactive(apiKey);
+                if (inactiveProject is not null)
+                {
+                    ctx.Response.StatusCode = 403;
+                    await ctx.Response.WriteAsJsonAsync(new { error = "project_deactivated" });
+                    return;
+                }
+
+                var inactiveUserKey = store.ResolveUserApiKeyIncludingInactive(apiKey);
+                if (inactiveUserKey is not null)
+                {
+                    ctx.Response.StatusCode = 403;
+                    await ctx.Response.WriteAsJsonAsync(new { error = "project_deactivated" });
+                    return;
+                }
+
+                ctx.Response.StatusCode = 401;
+                await ctx.Response.WriteAsJsonAsync(new { error = "invalid_api_key" });
                 return;
             }
-            ctx.Response.StatusCode = 401;
-            await ctx.Response.WriteAsJsonAsync(new { error = "invalid_api_key" });
-            return;
         }
-
-        var uid = ctx.Request.Headers["X-LLimit-User"].FirstOrDefault();
 
         // ── Budget check (daily, queries DB directly) ──
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
@@ -101,9 +128,11 @@ public static class ProxyHandler
             return;
         }
 
-        // ── Forward to Azure (validated at startup, guaranteed non-null) ──
-        var azureEndpoint = cfg["AZURE_OPENAI_ENDPOINT"]!;
-        var azureKey = cfg["AZURE_OPENAI_API_KEY"]!;
+        // ── Determine Azure endpoint and API key ──
+        // Per-project endpoint overrides the global configuration.  This lets different
+        // projects route to different Azure OpenAI resources or regions.
+        var azureEndpoint = proj.EndpointUrl ?? cfg["AZURE_OPENAI_ENDPOINT"]!;
+        var azureKey = proj.EndpointKey ?? cfg["AZURE_OPENAI_API_KEY"]!;
         var url = $"{azureEndpoint.TrimEnd('/')}/openai/deployments/{deployment}/{rest}{ctx.Request.QueryString}";
 
         var client = factory.CreateClient("Azure");

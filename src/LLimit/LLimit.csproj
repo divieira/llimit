@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Migrations\001_initial.sql" />
+    <EmbeddedResource Include="Migrations\002_oauth_user_keys.sql" />
   </ItemGroup>
 
 </Project>

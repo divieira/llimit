@@ -34,6 +34,15 @@ var azureApiKey = builder.Configuration["AZURE_OPENAI_API_KEY"]
     ?? throw new InvalidOperationException("AZURE_OPENAI_API_KEY environment variable is required");
 logger.LogInformation("Azure OpenAI endpoint configured: {Endpoint}", azureEndpoint);
 
+// OAuth config is optional; log its status so operators can tell at a glance whether
+// the user portal is enabled.
+if (OAuthHandler.TryGetOAuthConfig(builder.Configuration, out var oauthConfig))
+    logger.LogInformation("OAuth enabled: tenant={Tenant}, domain={Domain}",
+        oauthConfig.TenantId, oauthConfig.CorporateDomain ?? "(any)");
+else
+    logger.LogInformation("OAuth not configured — user portal will be unavailable " +
+        "(set AZURE_AD_TENANT_ID, AZURE_AD_CLIENT_ID, AZURE_AD_CLIENT_SECRET, LLIMIT_BASE_URL to enable)");
+
 // Load pricing: try LiteLLM online, fall back to DB-cached prices.
 // On success, prices are saved to DB for next startup's fallback.
 var httpFactory = app.Services.GetRequiredService<IHttpClientFactory>();
@@ -95,6 +104,8 @@ app.MapGet("/health", (Store s) =>
 app.MapProxy();
 app.MapAdmin();
 app.MapDashboard();
+app.MapAuth();        // Azure AD OAuth flow  (/auth/login, /auth/callback, /auth/logout)
+app.MapUserPortal();  // User self-service portal (/portal, /portal/keys/*)
 
 // ── Graceful shutdown ──
 // The cancellation token stops background timers, and Kestrel's shutdown timeout

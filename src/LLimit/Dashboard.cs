@@ -480,6 +480,27 @@ public static class DashboardRoutes
       </div>
     </fieldset>
 
+    <fieldset>
+      <legend>Azure OpenAI Endpoint (optional — overrides global config for this project)</legend>
+      <label for=""endpointUrl"">Endpoint URL
+        <input type=""url"" id=""endpointUrl"" name=""endpointUrl"" value=""{Enc(project.EndpointUrl)}"" placeholder=""https://your-resource.openai.azure.com"">
+      </label>
+      <label for=""endpointKey"">API Key <small style=""color:gray;"">(leave blank to keep current key)</small>
+        <input type=""password"" id=""endpointKey"" name=""endpointKey"" autocomplete=""new-password""
+               placeholder=""{(project.EndpointKey is null ? "Not set" : "••••••••")}"">
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>User Self-Service Keys</legend>
+      <label>
+        <input type=""checkbox"" name=""allowUserKeys"" value=""true"" {(project.AllowUserKeys ? "checked" : "")}>
+        Allow users to generate personal API keys for this project
+      </label>
+      <small>When enabled, authenticated users can create their own API key in the
+             <a href=""/portal"" target=""_blank"">User Portal</a>.</small>
+    </fieldset>
+
     <button type=""submit"">Save Settings</button>
   </form>
 </main>");
@@ -497,9 +518,14 @@ public static class DashboardRoutes
         var isActive = form["isActive"].FirstOrDefault() == "true";
         var budgetDaily = ParseDouble(form["budgetDaily"].FirstOrDefault());
         var defaultUserBudgetDaily = ParseDouble(form["defaultUserBudgetDaily"].FirstOrDefault());
+        var endpointUrl = form["endpointUrl"].FirstOrDefault();
+        var endpointKey = form["endpointKey"].FirstOrDefault();
+        var allowUserKeys = form["allowUserKeys"].FirstOrDefault() == "true";
 
         store.UpdateProject(id, name, budgetDaily, defaultUserBudgetDaily, isActive,
-            clearBudgets: true);
+            clearBudgets: true,
+            endpointUrl: endpointUrl, endpointKey: endpointKey,
+            allowUserKeys: allowUserKeys, updateEndpoints: true);
 
         return Results.Redirect($"/dashboard/projects/{WebUtility.UrlEncode(id)}/settings?saved=1");
     }
@@ -584,6 +610,7 @@ public static class DashboardRoutes
       <ul>
         <li><a href=""/dashboard/"">Overview</a></li>
         <li><a href=""/dashboard/pricing"">Pricing</a></li>
+        <li><a href=""/portal"">User Portal</a></li>
       </ul>
     </nav>" : "";
 
