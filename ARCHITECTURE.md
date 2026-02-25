@@ -2,17 +2,13 @@
 
 ## Overview
 
-llimit is a lightweight reverse-proxy in front of Azure OpenAI and Azure AI Foundry that:
-- Transparently forwards requests to the upstream backend with minimal overhead
+llimit is a lightweight reverse-proxy in front of Azure AI Foundry that:
+- Transparently forwards requests to the upstream with minimal overhead
 - Tracks costs per **project** and per **user** independently
 - Enforces **daily** budget limits per project and per user
-- Issues one API key per project (callers use it instead of the real backend key)
+- Issues one API key per project (callers use it instead of the real Foundry key)
 - Provides a web dashboard, log viewer, and project settings UI
 - Rejects requests for unknown models before forwarding (if model in request body)
-
-Two backends are supported and can be used simultaneously:
-- **Azure OpenAI** — GPT models via `/openai/deployments/{deployment}/...`
-- **Azure AI Foundry** — Claude (and other models) via `/v1/...` (OpenAI-compatible)
 
 Key design constraints:
 - **Core must be as lean as possible** — proxy logic separate from calculation/budget
@@ -35,10 +31,9 @@ Key design constraints:
 ## Request Flow
 
 ```
-Client                      llimit                              Backend (Azure OpenAI or Foundry)
+Client                      llimit                              Azure AI Foundry
   │                           │                                      │
-  │──POST /openai/deploy/X───>│  t0 = Stopwatch.Start()             │  ← Azure OpenAI path
-  │──POST /v1/chat/completions│  t0 = Stopwatch.Start()             │  ← Azure AI Foundry path
+  │──POST /v1/chat/completions│  t0 = Stopwatch.Start()             │
   │   api-key: <proj-key>     │                                      │
   │   X-LLimit-User: alice    │  (optional — null if absent)         │
   │                           │                                      │
@@ -55,7 +50,7 @@ Client                      llimit                              Backend (Azure O
   │                           │  t1 = mark pre-forward               │
   │                           │──forward request────────────────────>│
   │                           │                                      │
-  │                           │  t2 = first byte from backend        │
+  │                           │  t2 = first byte from Foundry        │
   │                           │──copy response HEADERS to client     │
   │<──response headers────────│<──response headers──────────────────│
   │<──response body (stream)──│<──response body (stream)────────────│
@@ -76,20 +71,20 @@ Four stopwatch marks per request, three stored columns:
 t0 ─── request received
  │  auth + budget check + body read + stream_options inject
 t1 ─── HttpClient.SendAsync() called
- │  network round-trip to Azure (TTFB for streaming)
-t2 ─── first byte from Azure (headers arrive)
+ │  network round-trip to Foundry (TTFB for streaming)
+t2 ─── first byte from Foundry (headers arrive)
  │  body transfer / SSE streaming
 t3 ─── last byte / response fully sent to client
 ```
 
-| Column             | Formula      | What it measures                                  |
-|--------------------|--------------|---------------------------------------------------|
-| `upstream_ms`      | `t2 - t1`    | Azure processing + network RTT (time-to-first-byte) |
-| `transfer_ms`      | `t3 - t2`    | Body/stream transfer time (0 for non-stream)      |
-| `overhead_ms`      | `t1 - t0`    | Our pre-forward work (auth, budget, body parse)   |
-| `total_ms`         | `t3 - t0`    | End-to-end from client's perspective              |
+| Column             | Formula      | What it measures                                     |
+|--------------------|--------------|------------------------------------------------------|
+| `upstream_ms`      | `t2 - t1`    | Foundry processing + network RTT (time-to-first-byte) |
+| `transfer_ms`      | `t3 - t2`    | Body/stream transfer time (0 for non-stream)         |
+| `overhead_ms`      | `t1 - t0`    | Our pre-forward work (auth, budget, body parse)      |
+| `total_ms`         | `t3 - t0`    | End-to-end from client's perspective                 |
 
-For **non-streaming**: `t2 ≈ t3` — `transfer_ms ≈ 0`, `upstream_ms` captures the full Azure round-trip.
+For **non-streaming**: `t2 ≈ t3` — `transfer_ms ≈ 0`, `upstream_ms` captures the full round-trip.
 For **streaming**: `upstream_ms` is TTFB (~200ms), `transfer_ms` is the SSE streaming duration.
 
 ## In-Memory State
@@ -199,16 +194,8 @@ CREATE TABLE usage_daily (
 
 ## API Surface
 
-### Proxy (pass-through to backend)
+### Proxy (pass-through to Azure AI Foundry)
 
-**Azure OpenAI** (registered when `AZURE_OPENAI_ENDPOINT` is configured):
-```
-POST /openai/deployments/{deployment}/chat/completions?api-version={ver}
-POST /openai/deployments/{deployment}/completions?api-version={ver}
-POST /openai/deployments/{deployment}/embeddings?api-version={ver}
-```
-
-**Azure AI Foundry** (registered when `AZURE_FOUNDRY_ENDPOINT` is configured):
 ```
 POST /v1/chat/completions
 POST /v1/embeddings
@@ -263,16 +250,12 @@ LLimit/
 
 ## Configuration
 
-At least one backend must be configured. Both can be active simultaneously.
-
-| Variable                  | Required | Description                                                           |
-|--------------------------|----------|-----------------------------------------------------------------------|
-| `AZURE_OPENAI_ENDPOINT`  | One of Azure OpenAI or Foundry | Azure OpenAI resource URL (`https://<resource>.openai.azure.com/`) |
-| `AZURE_OPENAI_API_KEY`   | One of Azure OpenAI or Foundry | Azure OpenAI API key                                                |
-| `AZURE_FOUNDRY_ENDPOINT` | One of Azure OpenAI or Foundry | Azure AI Foundry endpoint URL (`https://<resource>.<region>.inference.ai.azure.com`) |
-| `AZURE_FOUNDRY_API_KEY`  | One of Azure OpenAI or Foundry | Azure AI Foundry API key                                            |
-| `LLIMIT_ADMIN_TOKEN`     | Yes      | Bearer token for admin API and dashboard login                        |
-| `LLIMIT_DB_PATH`         | No       | SQLite database path (default: `llimit.db`)                           |
+| Variable                  | Required | Description                                                                         |
+|--------------------------|----------|-------------------------------------------------------------------------------------|
+| `AZURE_FOUNDRY_ENDPOINT` | Yes      | Azure AI Foundry endpoint URL (`https://<resource>.<region>.inference.ai.azure.com`) |
+| `AZURE_FOUNDRY_API_KEY`  | Yes      | Azure AI Foundry API key                                                            |
+| `LLIMIT_ADMIN_TOKEN`     | Yes      | Bearer token for admin API and dashboard login                                      |
+| `LLIMIT_DB_PATH`         | No       | SQLite database path (default: `llimit.db`)                                         |
 
 **Local development** uses `Properties/launchSettings.json` which sets `ASPNETCORE_ENVIRONMENT=Development`
 and listens on port 5125. See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/environments
@@ -280,7 +263,6 @@ and listens on port 5125. See: https://learn.microsoft.com/en-us/aspnet/core/fun
 ## Key Decisions
 
 - **C# (.NET 8 Minimal API)** — 2 NuGet packages, everything else built-in
-- **Two backends, one gateway** — Azure OpenAI (`/openai/deployments/...`) and Azure AI Foundry (`/v1/...`) share auth, budget, cost, and logging logic; routes registered conditionally based on which env vars are set
 - **Daily budgets only** — simple, no cache needed, direct DB queries
 - **User is optional** — null if absent, per-user limits skipped for anonymous requests
 - **LiteLLM pricing with DB fallback** — fetched on startup, saved to DB; falls back to DB cache if fetch fails; refreshed every 6h

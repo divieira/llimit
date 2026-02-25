@@ -10,45 +10,14 @@ public record BudgetDeny(string Scope, double Budget, double Used)
 
 public static class ProxyHandler
 {
-    public static void MapAzureProxy(this WebApplication app)
+    public static void MapProxy(this WebApplication app)
     {
-        app.MapPost("/openai/deployments/{deployment}/{**rest}", HandleAzureProxy);
+        app.MapPost("/v1/{**rest}", HandleProxy);
     }
 
-    public static void MapFoundryProxy(this WebApplication app)
-    {
-        app.MapPost("/v1/{**rest}", HandleFoundryProxy);
-    }
-
-    private static async Task HandleAzureProxy(HttpContext ctx, string deployment, string rest,
+    private static async Task HandleProxy(HttpContext ctx, string rest,
         Store store, PricingTable pricing,
         IHttpClientFactory factory, IConfiguration cfg, ILogger<Program> logger)
-    {
-        var azureEndpoint = cfg["AZURE_OPENAI_ENDPOINT"]!;
-        var azureKey = cfg["AZURE_OPENAI_API_KEY"]!;
-        var targetUrl = $"{azureEndpoint.TrimEnd('/')}/openai/deployments/{deployment}/{rest}{ctx.Request.QueryString}";
-        await HandleProxyCore(ctx, deployment, rest, store, pricing, factory, logger,
-            targetUrl, azureKey, "Azure");
-    }
-
-    private static async Task HandleFoundryProxy(HttpContext ctx, string rest,
-        Store store, PricingTable pricing,
-        IHttpClientFactory factory, IConfiguration cfg, ILogger<Program> logger)
-    {
-        var foundryEndpoint = cfg["AZURE_FOUNDRY_ENDPOINT"]!;
-        var foundryKey = cfg["AZURE_FOUNDRY_API_KEY"]!;
-        var targetUrl = $"{foundryEndpoint.TrimEnd('/')}/v1/{rest}{ctx.Request.QueryString}";
-        // Foundry has no deployment concept in the URL — deployment is resolved from the request
-        // body's model field (or response model field) after body parsing.
-        await HandleProxyCore(ctx, null, rest, store, pricing, factory, logger,
-            targetUrl, foundryKey, "Foundry");
-    }
-
-    private static async Task HandleProxyCore(
-        HttpContext ctx, string? deployment, string endpoint,
-        Store store, PricingTable pricing,
-        IHttpClientFactory factory, ILogger logger,
-        string targetUrl, string backendApiKey, string clientName)
     {
         var sw = Stopwatch.StartNew();
 
@@ -106,15 +75,10 @@ public static class ProxyHandler
             using var doc = JsonDocument.Parse(bodyBytes);
             isStream = doc.RootElement.TryGetProperty("stream", out var sv) && sv.GetBoolean();
 
-            // Extract model from request body if present (OpenAI SDK clients include it).
-            // Azure OpenAI ignores this field (deployment determines the model), but we use
-            // it for pre-validation when available. For Foundry, model is required.
             if (doc.RootElement.TryGetProperty("model", out var mv))
                 requestModel = mv.GetString();
 
-            // Ensure stream_options.include_usage=true for streaming requests.
-            // Both Azure OpenAI and Azure AI Foundry include token usage in the final SSE
-            // chunk only when this is set.
+            // Ensure stream_options.include_usage=true so token usage appears in the final SSE chunk.
             // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
             if (isStream)
                 bodyBytes = EnsureStreamIncludeUsage(doc, bodyBytes);
@@ -132,16 +96,16 @@ public static class ProxyHandler
             return;
         }
 
-        // For Foundry (no route-level deployment), use the model from the request body.
-        // For Azure, deployment is set from the route.
-        var logDeployment = deployment ?? requestModel ?? "";
+        // ── Forward to Azure AI Foundry (validated at startup, guaranteed non-null) ──
+        var foundryEndpoint = cfg["AZURE_FOUNDRY_ENDPOINT"]!;
+        var foundryKey = cfg["AZURE_FOUNDRY_API_KEY"]!;
+        var url = $"{foundryEndpoint.TrimEnd('/')}/v1/{rest}{ctx.Request.QueryString}";
 
-        // ── Forward to backend ──
-        var client = factory.CreateClient(clientName);
-        using var req = new HttpRequestMessage(HttpMethod.Post, targetUrl);
+        var client = factory.CreateClient("Foundry");
+        using var req = new HttpRequestMessage(HttpMethod.Post, url);
         req.Content = new ByteArrayContent(bodyBytes);
         req.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-        req.Headers.Add("api-key", backendApiKey);
+        req.Headers.Add("api-key", foundryKey);
 
         var overheadMs = (int)sw.ElapsedMilliseconds;
 
@@ -159,7 +123,7 @@ public static class ProxyHandler
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Failed to reach {Client} for {Deployment}/{Endpoint}", clientName, logDeployment, endpoint);
+            logger.LogError(ex, "Failed to reach Foundry for {Model}/{Endpoint}", requestModel, rest);
             ctx.Response.StatusCode = 502;
             await ctx.Response.WriteAsJsonAsync(new { error = "upstream_error" });
             return;
@@ -202,18 +166,13 @@ public static class ProxyHandler
         // ── Calculate cost (synchronous — only DB write is async) ──
         var cost = pricing.Calculate(model, promptTokens, completionTokens) ?? 0;
 
-        // For Foundry, refine logDeployment from the model returned in the response body
-        // (requestModel may have been null if the body wasn't parseable as JSON).
-        if (deployment is null && model != "")
-            logDeployment = model;
-
         // Fire-and-forget: persist to DB only
         _ = Task.Run(() =>
         {
             try
             {
                 var now = DateTime.UtcNow;
-                store.LogRequest(proj.Id, uid, now.ToString("o"), model, logDeployment, endpoint,
+                store.LogRequest(proj.Id, uid, now.ToString("o"), model, model, rest,
                     promptTokens, completionTokens, cost, (int)resp.StatusCode,
                     overheadMs, upstreamMs, transferMs, totalMs, isStream);
                 store.UpsertUsageDaily(proj.Id, uid, DateOnly.FromDateTime(now), cost, promptTokens, completionTokens);
@@ -221,7 +180,7 @@ public static class ProxyHandler
             catch (Exception ex)
             {
                 Interlocked.Increment(ref Diagnostics.AsyncFailures);
-                logger.LogError(ex, "Async DB write failed for {Project}/{Deployment}", proj.Id, logDeployment);
+                logger.LogError(ex, "Async DB write failed for {Project}/{Model}", proj.Id, model);
             }
         });
     }
@@ -235,16 +194,16 @@ public static class ProxyHandler
         var body = await resp.Content.ReadAsByteArrayAsync();
         await ctx.Response.Body.WriteAsync(body);
 
-        // For non-streaming responses, the backend always includes usage in the response body.
+        // For non-streaming responses, Foundry always includes usage in the response body.
         // See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
         return ExtractUsage(body, logger);
     }
 
     /// <summary>
     /// Forwards an SSE streaming response line-by-line and extracts usage from the final chunk.
-    /// Both Azure OpenAI and Azure AI Foundry stream as Server-Sent Events: each event is
-    /// "data: {json}\n\n", the final usage chunk has choices=[] with a usage object, and
-    /// the stream ends with "data: [DONE]".
+    /// Azure AI Foundry streams as Server-Sent Events: each event is "data: {json}\n\n",
+    /// the final usage chunk has choices=[] with a usage object, and the stream ends with
+    /// "data: [DONE]".
     /// See: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#chat-completions
     /// </summary>
     private static async Task<(string model, int promptTokens, int completionTokens)> ForwardStream(
@@ -297,7 +256,7 @@ public static class ProxyHandler
 
     /// <summary>
     /// Parses a JSON response body to extract model name and token usage.
-    /// Throws if the usage property is missing (the backend always includes it when
+    /// Throws if the usage property is missing (Foundry always includes it when
     /// stream_options.include_usage=true or for non-streaming responses).
     /// </summary>
     private static (string model, int promptTokens, int completionTokens) ExtractUsage(
@@ -310,7 +269,7 @@ public static class ProxyHandler
                 ? mv.GetString() ?? ""
                 : "";
 
-            // Don't TryGet — usage must be present. The backend includes it in all non-streaming
+            // Don't TryGet — usage must be present. Foundry includes it in all non-streaming
             // responses and in the final streaming chunk when include_usage=true.
             var usage = doc.RootElement.GetProperty("usage");
             var pt = usage.GetProperty("prompt_tokens").GetInt32();
