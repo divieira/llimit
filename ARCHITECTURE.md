@@ -2,13 +2,17 @@
 
 ## Overview
 
-llimit is a lightweight reverse-proxy in front of Azure OpenAI that:
-- Transparently forwards requests to Azure with minimal overhead
+llimit is a lightweight reverse-proxy in front of Azure OpenAI and Azure AI Foundry that:
+- Transparently forwards requests to the upstream backend with minimal overhead
 - Tracks costs per **project** and per **user** independently
 - Enforces **daily** budget limits per project and per user
-- Issues one API key per project (callers use it instead of the real Azure key)
+- Issues one API key per project (callers use it instead of the real backend key)
 - Provides a web dashboard, log viewer, and project settings UI
 - Rejects requests for unknown models before forwarding (if model in request body)
+
+Two backends are supported and can be used simultaneously:
+- **Azure OpenAI** — GPT models via `/openai/deployments/{deployment}/...`
+- **Azure AI Foundry** — Claude (and other models) via `/v1/...` (OpenAI-compatible)
 
 Key design constraints:
 - **Core must be as lean as possible** — proxy logic separate from calculation/budget
@@ -31,9 +35,10 @@ Key design constraints:
 ## Request Flow
 
 ```
-Client                      llimit                              Azure OpenAI
+Client                      llimit                              Backend (Azure OpenAI or Foundry)
   │                           │                                      │
-  │──POST /openai/deploy/X───>│  t0 = Stopwatch.Start()             │
+  │──POST /openai/deploy/X───>│  t0 = Stopwatch.Start()             │  ← Azure OpenAI path
+  │──POST /v1/chat/completions│  t0 = Stopwatch.Start()             │  ← Azure AI Foundry path
   │   api-key: <proj-key>     │                                      │
   │   X-LLimit-User: alice    │  (optional — null if absent)         │
   │                           │                                      │
@@ -50,7 +55,7 @@ Client                      llimit                              Azure OpenAI
   │                           │  t1 = mark pre-forward               │
   │                           │──forward request────────────────────>│
   │                           │                                      │
-  │                           │  t2 = first byte from Azure          │
+  │                           │  t2 = first byte from backend        │
   │                           │──copy response HEADERS to client     │
   │<──response headers────────│<──response headers──────────────────│
   │<──response body (stream)──│<──response body (stream)────────────│
@@ -194,15 +199,22 @@ CREATE TABLE usage_daily (
 
 ## API Surface
 
-### Proxy (pass-through to Azure)
+### Proxy (pass-through to backend)
 
+**Azure OpenAI** (registered when `AZURE_OPENAI_ENDPOINT` is configured):
 ```
 POST /openai/deployments/{deployment}/chat/completions?api-version={ver}
 POST /openai/deployments/{deployment}/completions?api-version={ver}
 POST /openai/deployments/{deployment}/embeddings?api-version={ver}
 ```
 
-Required: `api-key` header. Optional: `X-LLimit-User` header.
+**Azure AI Foundry** (registered when `AZURE_FOUNDRY_ENDPOINT` is configured):
+```
+POST /v1/chat/completions
+POST /v1/embeddings
+```
+
+Required: `api-key` header (llimit project key). Optional: `X-LLimit-User` header.
 
 ### Admin API (`Authorization: Bearer <admin-token>`)
 
@@ -251,12 +263,16 @@ LLimit/
 
 ## Configuration
 
-| Variable                | Required | Description                                                     |
-|------------------------|----------|-----------------------------------------------------------------|
-| `AZURE_OPENAI_ENDPOINT`| Yes      | Azure OpenAI resource URL (`https://<resource>.openai.azure.com/`) |
-| `AZURE_OPENAI_API_KEY` | Yes      | Azure OpenAI API key                                            |
-| `LLIMIT_ADMIN_TOKEN`   | Yes      | Bearer token for admin API and dashboard login                  |
-| `LLIMIT_DB_PATH`       | No       | SQLite database path (default: `llimit.db`)                     |
+At least one backend must be configured. Both can be active simultaneously.
+
+| Variable                  | Required | Description                                                           |
+|--------------------------|----------|-----------------------------------------------------------------------|
+| `AZURE_OPENAI_ENDPOINT`  | One of Azure OpenAI or Foundry | Azure OpenAI resource URL (`https://<resource>.openai.azure.com/`) |
+| `AZURE_OPENAI_API_KEY`   | One of Azure OpenAI or Foundry | Azure OpenAI API key                                                |
+| `AZURE_FOUNDRY_ENDPOINT` | One of Azure OpenAI or Foundry | Azure AI Foundry endpoint URL (`https://<resource>.<region>.inference.ai.azure.com`) |
+| `AZURE_FOUNDRY_API_KEY`  | One of Azure OpenAI or Foundry | Azure AI Foundry API key                                            |
+| `LLIMIT_ADMIN_TOKEN`     | Yes      | Bearer token for admin API and dashboard login                        |
+| `LLIMIT_DB_PATH`         | No       | SQLite database path (default: `llimit.db`)                           |
 
 **Local development** uses `Properties/launchSettings.json` which sets `ASPNETCORE_ENVIRONMENT=Development`
 and listens on port 5125. See: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/environments
@@ -264,6 +280,7 @@ and listens on port 5125. See: https://learn.microsoft.com/en-us/aspnet/core/fun
 ## Key Decisions
 
 - **C# (.NET 8 Minimal API)** — 2 NuGet packages, everything else built-in
+- **Two backends, one gateway** — Azure OpenAI (`/openai/deployments/...`) and Azure AI Foundry (`/v1/...`) share auth, budget, cost, and logging logic; routes registered conditionally based on which env vars are set
 - **Daily budgets only** — simple, no cache needed, direct DB queries
 - **User is optional** — null if absent, per-user limits skipped for anonymous requests
 - **LiteLLM pricing with DB fallback** — fetched on startup, saved to DB; falls back to DB cache if fetch fails; refreshed every 6h
