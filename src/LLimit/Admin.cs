@@ -65,7 +65,10 @@ public static class AdminRoutes
         var result = projects.Select(p => new
         {
             p.Id, p.Name, p.IsActive,
+            p.EndpointUrl,
+            EndpointKeyConfigured = !string.IsNullOrEmpty(p.EndpointKey),
             p.BudgetDaily, p.DefaultUserBudgetDaily,
+            p.AllowUserKeys,
             UsageToday = todayCosts.GetValueOrDefault(p.Id)
         });
         return Results.Ok(result);
@@ -75,16 +78,23 @@ public static class AdminRoutes
     {
         if (string.IsNullOrWhiteSpace(req.Id) || string.IsNullOrWhiteSpace(req.Name))
             return Results.BadRequest(new { error = "id and name are required" });
+        if (string.IsNullOrWhiteSpace(req.EndpointUrl) || string.IsNullOrWhiteSpace(req.EndpointKey))
+            return Results.BadRequest(new { error = "endpointUrl and endpointKey are required" });
 
         try
         {
             var (project, plainKey) = store.CreateProject(req.Id, req.Name,
-                req.BudgetDaily, req.DefaultUserBudgetDaily);
+                req.EndpointUrl, req.EndpointKey,
+                req.BudgetDaily, req.DefaultUserBudgetDaily,
+                req.AllowUserKeys ?? false);
 
             return Results.Created($"/api/v1/projects/{project.Id}", new
             {
                 project.Id, project.Name, ApiKey = plainKey,
-                project.BudgetDaily, project.DefaultUserBudgetDaily
+                project.EndpointUrl,
+                EndpointKeyConfigured = true,
+                project.BudgetDaily, project.DefaultUserBudgetDaily,
+                project.AllowUserKeys
             });
         }
         catch (Exception ex) when (ex.Message.Contains("UNIQUE"))
@@ -104,7 +114,10 @@ public static class AdminRoutes
         return Results.Ok(new
         {
             project.Id, project.Name, project.IsActive,
+            project.EndpointUrl,
+            EndpointKeyConfigured = !string.IsNullOrEmpty(project.EndpointKey),
             project.BudgetDaily, project.DefaultUserBudgetDaily,
+            project.AllowUserKeys,
             project.CreatedAt, project.UpdatedAt,
             UsageToday = todayCost
         });
@@ -115,7 +128,9 @@ public static class AdminRoutes
         var project = store.GetProject(id);
         if (project is null) return Results.NotFound(new { error = "project not found" });
 
-        store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive);
+        store.UpdateProject(id, req.Name, req.BudgetDaily, req.DefaultUserBudgetDaily, req.IsActive,
+            allowUserKeys: req.AllowUserKeys,
+            endpointUrl: req.EndpointUrl, endpointKey: req.EndpointKey);
         return Results.Ok(store.GetProject(id));
     }
 
@@ -224,10 +239,13 @@ public static class AdminRoutes
 // ── Request DTOs ──
 
 public record CreateProjectRequest(string Id, string Name,
-    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null);
+    string EndpointUrl, string EndpointKey,
+    double? BudgetDaily = null, double? DefaultUserBudgetDaily = null,
+    bool? AllowUserKeys = null);
 
 public record UpdateProjectRequest(string? Name = null,
     double? BudgetDaily = null, double? DefaultUserBudgetDaily = null,
-    bool? IsActive = null);
+    bool? IsActive = null, bool? AllowUserKeys = null,
+    string? EndpointUrl = null, string? EndpointKey = null);
 
 public record UpsertPricingRequest(double InputPerMillion, double OutputPerMillion);

@@ -7,8 +7,16 @@ namespace LLimit;
 
 public record Project(
     string Id, string Name, string ApiKeyHash,
+    string EndpointUrl, string EndpointKey,
     double? BudgetDaily, double? DefaultUserBudgetDaily,
-    bool IsActive, string CreatedAt, string UpdatedAt);
+    bool AllowUserKeys, bool IsActive,
+    string CreatedAt, string UpdatedAt);
+
+public record User(string Id, string Email, string DisplayName, string CreatedAt, string LastLogin);
+
+public record UserApiKey(int Id, string UserId, string ProjectId, string ApiKeyHash, string CreatedAt, string? RevokedAt);
+
+public record UserSession(string TokenHash, string UserId, string CreatedAt, string ExpiresAt);
 
 public record ModelPricing(string ModelPattern, double InputPerMillion, double OutputPerMillion, string UpdatedAt);
 
@@ -26,6 +34,14 @@ public record UsageDaily(string ProjectId, string? UserId, string Date,
 public class Store : IDisposable
 {
     private readonly string _connStr;
+
+    // DRY: shared column list for all Project SELECT queries
+    private const string ProjectCols =
+        "id, name, api_key_hash AS ApiKeyHash, " +
+        "endpoint_url AS EndpointUrl, endpoint_key AS EndpointKey, " +
+        "budget_daily AS BudgetDaily, default_user_budget_daily AS DefaultUserBudgetDaily, " +
+        "allow_user_keys AS AllowUserKeys, is_active AS IsActive, " +
+        "created_at AS CreatedAt, updated_at AS UpdatedAt";
 
     public Store(string dbPath)
     {
@@ -73,23 +89,20 @@ public class Store : IDisposable
     public List<Project> GetAllProjects()
     {
         using var conn = Open();
-        return conn.Query<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
-            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt FROM projects").AsList();
+        return conn.Query<Project>($"SELECT {ProjectCols} FROM projects").AsList();
     }
 
     public Project? GetProject(string id)
     {
         using var conn = Open();
         return conn.QueryFirstOrDefault<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
-            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt FROM projects WHERE id = @id", new { id });
+            $"SELECT {ProjectCols} FROM projects WHERE id = @id", new { id });
     }
 
     public (Project project, string plainKey) CreateProject(string id, string name,
-        double? budgetDaily = null, double? defaultUserBudgetDaily = null)
+        string endpointUrl, string endpointKey,
+        double? budgetDaily = null, double? defaultUserBudgetDaily = null,
+        bool allowUserKeys = false)
     {
         var plainKey = $"llimit-{Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant()}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(plainKey))).ToLowerInvariant();
@@ -97,9 +110,11 @@ public class Store : IDisposable
 
         using var conn = Open();
         conn.Execute(
-            "INSERT INTO projects (id, name, api_key_hash, budget_daily, default_user_budget_daily, is_active, created_at, updated_at) " +
-            "VALUES (@id, @name, @hash, @budgetDaily, @defaultUserBudgetDaily, 1, @now, @now)",
-            new { id, name, hash, budgetDaily, defaultUserBudgetDaily, now });
+            "INSERT INTO projects (id, name, api_key_hash, endpoint_url, endpoint_key, " +
+            "budget_daily, default_user_budget_daily, allow_user_keys, is_active, created_at, updated_at) " +
+            "VALUES (@id, @name, @hash, @endpointUrl, @endpointKey, " +
+            "@budgetDaily, @defaultUserBudgetDaily, @allowUserKeys, 1, @now, @now)",
+            new { id, name, hash, endpointUrl, endpointKey, budgetDaily, defaultUserBudgetDaily, allowUserKeys, now });
 
         var project = GetProject(id)!;
         return (project, plainKey);
@@ -107,7 +122,10 @@ public class Store : IDisposable
 
     public void UpdateProject(string id, string? name = null,
         double? budgetDaily = null, double? defaultUserBudgetDaily = null,
-        bool? isActive = null, bool clearBudgets = false)
+        bool? isActive = null, bool clearBudgets = false,
+        bool? allowUserKeys = null,
+        string? endpointUrl = null, string? endpointKey = null,
+        bool clearEndpoint = false)
     {
         var now = DateTime.UtcNow.ToString("o");
         using var conn = Open();
@@ -117,9 +135,12 @@ public class Store : IDisposable
         if (clearBudgets || budgetDaily != null) sets.Add("budget_daily = @budgetDaily");
         if (clearBudgets || defaultUserBudgetDaily != null) sets.Add("default_user_budget_daily = @defaultUserBudgetDaily");
         if (isActive != null) sets.Add("is_active = @isActive");
+        if (allowUserKeys != null) sets.Add("allow_user_keys = @allowUserKeys");
+        if (clearEndpoint || endpointUrl != null) sets.Add("endpoint_url = @endpointUrl");
+        if (clearEndpoint || endpointKey != null) sets.Add("endpoint_key = @endpointKey");
 
         conn.Execute($"UPDATE projects SET {string.Join(", ", sets)} WHERE id = @id",
-            new { id, name, budgetDaily, defaultUserBudgetDaily, isActive, now });
+            new { id, name, budgetDaily, defaultUserBudgetDaily, isActive, allowUserKeys, endpointUrl, endpointKey, now });
     }
 
     public void DeactivateProject(string id)
@@ -137,10 +158,7 @@ public class Store : IDisposable
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
         using var conn = Open();
         return conn.QueryFirstOrDefault<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
-            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt " +
-            "FROM projects WHERE api_key_hash = @hash AND is_active = 1", new { hash });
+            $"SELECT {ProjectCols} FROM projects WHERE api_key_hash = @hash AND is_active = 1", new { hash });
     }
 
     public Project? ResolveApiKeyIncludingInactive(string apiKey)
@@ -149,10 +167,136 @@ public class Store : IDisposable
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
         using var conn = Open();
         return conn.QueryFirstOrDefault<Project>(
-            "SELECT id, name, api_key_hash AS ApiKeyHash, budget_daily AS BudgetDaily, " +
-            "default_user_budget_daily AS DefaultUserBudgetDaily, " +
-            "is_active AS IsActive, created_at AS CreatedAt, updated_at AS UpdatedAt " +
-            "FROM projects WHERE api_key_hash = @hash", new { hash });
+            $"SELECT {ProjectCols} FROM projects WHERE api_key_hash = @hash", new { hash });
+    }
+
+    /// <summary>
+    /// Resolves a user API key to (Project, UserId). Returns null if not found or revoked.
+    /// </summary>
+    public (Project Project, string UserId)? ResolveUserApiKey(string apiKey)
+    {
+        if (string.IsNullOrEmpty(apiKey)) return null;
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(apiKey))).ToLowerInvariant();
+        using var conn = Open();
+
+        var row = conn.QueryFirstOrDefault<(string UserId, string ProjectId)>(
+            "SELECT user_id AS UserId, project_id AS ProjectId FROM user_api_keys " +
+            "WHERE api_key_hash = @hash AND revoked_at IS NULL", new { hash });
+
+        if (row.ProjectId is null) return null;
+
+        var proj = conn.QueryFirstOrDefault<Project>(
+            $"SELECT {ProjectCols} FROM projects WHERE id = @id AND is_active = 1",
+            new { id = row.ProjectId });
+
+        return proj is null ? null : (proj, row.UserId);
+    }
+
+    // ── Users ──
+
+    public void UpsertUser(string id, string email, string displayName)
+    {
+        var now = DateTime.UtcNow.ToString("o");
+        using var conn = Open();
+        conn.Execute(
+            "INSERT INTO users (id, email, display_name, created_at, last_login) " +
+            "VALUES (@id, @email, @displayName, @now, @now) " +
+            "ON CONFLICT(id) DO UPDATE SET display_name = @displayName, last_login = @now",
+            new { id, email, displayName, now });
+    }
+
+    public User? GetUser(string id)
+    {
+        using var conn = Open();
+        return conn.QueryFirstOrDefault<User>(
+            "SELECT id, email, display_name AS DisplayName, created_at AS CreatedAt, last_login AS LastLogin " +
+            "FROM users WHERE id = @id", new { id });
+    }
+
+    // ── User API Keys ──
+
+    public string CreateUserApiKey(string userId, string projectId)
+    {
+        var plainKey = $"llimit-u-{Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant()}";
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(plainKey))).ToLowerInvariant();
+        var now = DateTime.UtcNow.ToString("o");
+
+        using var conn = Open();
+        conn.Execute(
+            "INSERT INTO user_api_keys (user_id, project_id, api_key_hash, created_at) " +
+            "VALUES (@userId, @projectId, @hash, @now)",
+            new { userId, projectId, hash, now });
+
+        return plainKey;
+    }
+
+    public UserApiKey? GetActiveUserApiKey(string userId, string projectId)
+    {
+        using var conn = Open();
+        return conn.QueryFirstOrDefault<UserApiKey>(
+            "SELECT id, user_id AS UserId, project_id AS ProjectId, api_key_hash AS ApiKeyHash, " +
+            "created_at AS CreatedAt, revoked_at AS RevokedAt " +
+            "FROM user_api_keys WHERE user_id = @userId AND project_id = @projectId AND revoked_at IS NULL",
+            new { userId, projectId });
+    }
+
+    public void RevokeUserApiKey(string userId, string projectId)
+    {
+        var now = DateTime.UtcNow.ToString("o");
+        using var conn = Open();
+        conn.Execute(
+            "UPDATE user_api_keys SET revoked_at = @now WHERE user_id = @userId AND project_id = @projectId AND revoked_at IS NULL",
+            new { userId, projectId, now });
+    }
+
+    public List<UserApiKey> GetUserApiKeys(string userId)
+    {
+        using var conn = Open();
+        return conn.Query<UserApiKey>(
+            "SELECT id, user_id AS UserId, project_id AS ProjectId, api_key_hash AS ApiKeyHash, " +
+            "created_at AS CreatedAt, revoked_at AS RevokedAt " +
+            "FROM user_api_keys WHERE user_id = @userId AND revoked_at IS NULL",
+            new { userId }).AsList();
+    }
+
+    public List<Project> GetProjectsAllowingUserKeys()
+    {
+        using var conn = Open();
+        return conn.Query<Project>(
+            $"SELECT {ProjectCols} FROM projects WHERE allow_user_keys = 1 AND is_active = 1").AsList();
+    }
+
+    // ── User Sessions ──
+
+    public void CreateUserSession(string tokenHash, string userId, TimeSpan duration)
+    {
+        var now = DateTime.UtcNow;
+        using var conn = Open();
+        conn.Execute(
+            "INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at) " +
+            "VALUES (@tokenHash, @userId, @createdAt, @expiresAt)",
+            new { tokenHash, userId, createdAt = now.ToString("o"), expiresAt = now.Add(duration).ToString("o") });
+    }
+
+    public UserSession? GetUserSession(string tokenHash)
+    {
+        using var conn = Open();
+        return conn.QueryFirstOrDefault<UserSession>(
+            "SELECT token_hash AS TokenHash, user_id AS UserId, created_at AS CreatedAt, expires_at AS ExpiresAt " +
+            "FROM user_sessions WHERE token_hash = @tokenHash", new { tokenHash });
+    }
+
+    public void DeleteUserSession(string tokenHash)
+    {
+        using var conn = Open();
+        conn.Execute("DELETE FROM user_sessions WHERE token_hash = @tokenHash", new { tokenHash });
+    }
+
+    public void CleanExpiredSessions()
+    {
+        var now = DateTime.UtcNow.ToString("o");
+        using var conn = Open();
+        conn.Execute("DELETE FROM user_sessions WHERE expires_at < @now", new { now });
     }
 
     // ── Pricing ──

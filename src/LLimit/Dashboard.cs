@@ -104,11 +104,16 @@ public static class DashboardRoutes
                 ? "<span style=\"color:green;\">Active</span>"
                 : "<span style=\"color:red;\">Inactive</span>";
 
+            var userKeysBadge = p.AllowUserKeys
+                ? "<span style=\"color:green;\">Yes</span>"
+                : "<span style=\"color:gray;\">No</span>";
+
             projectRows += $@"
 <tr>
   <td><a href=""/dashboard/projects/{Enc(p.Id)}"">{Enc(p.Name)}</a></td>
   <td><code>{Enc(p.Id)}</code></td>
   <td>{statusBadge}</td>
+  <td>{userKeysBadge}</td>
   <td>${todayCost:F4}</td>
   <td>{Fmt(p.BudgetDaily)}</td>
   <td style=""min-width:120px;"">{budgetBar}</td>
@@ -159,12 +164,12 @@ public static class DashboardRoutes
     <table role=""grid"">
       <thead>
         <tr>
-          <th>Name</th><th>ID</th><th>Status</th><th>Today</th>
+          <th>Name</th><th>ID</th><th>Status</th><th>User Keys</th><th>Today</th>
           <th>Daily Limit</th><th>Daily Usage</th>
         </tr>
       </thead>
       <tbody>
-        {(projectRows.Length > 0 ? projectRows : "<tr><td colspan=\"6\">No projects yet</td></tr>")}
+        {(projectRows.Length > 0 ? projectRows : "<tr><td colspan=\"7\">No projects yet</td></tr>")}
       </tbody>
     </table>
     </figure>
@@ -296,7 +301,8 @@ public static class DashboardRoutes
 
   <hgroup>
     <h2>{Enc(project.Name)}</h2>
-    <p>ID: <code>{Enc(project.Id)}</code> | Status: {statusBadge} | Today: <strong>${todayCost:F4}</strong></p>
+    <p>ID: <code>{Enc(project.Id)}</code> | Status: {statusBadge} | Today: <strong>${todayCost:F4}</strong> | User Keys: {(project.AllowUserKeys ? "Enabled" : "Disabled")}</p>
+    <p>Endpoint: <code>{Enc(project.EndpointUrl)}</code></p>
   </hgroup>
 
   <div hx-get=""/dashboard/projects/{Enc(id)}"" hx-trigger=""every 30s"" hx-select=""main"" hx-target=""main"" hx-swap=""outerHTML""></div>
@@ -462,10 +468,25 @@ public static class DashboardRoutes
       <label for=""name"">Name</label>
       <input type=""text"" id=""name"" name=""name"" value=""{Enc(project.Name)}"" required>
 
-      <label>
-        <input type=""checkbox"" name=""isActive"" value=""true"" {(project.IsActive ? "checked" : "")}>
-        Active
-      </label>
+      <div class=""grid"">
+        <label>
+          <input type=""checkbox"" name=""isActive"" value=""true"" {(project.IsActive ? "checked" : "")}>
+          Active
+        </label>
+        <label>
+          <input type=""checkbox"" name=""allowUserKeys"" value=""true"" {(project.AllowUserKeys ? "checked" : "")}>
+          Allow User Keys (self-service via portal)
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Azure OpenAI Endpoint</legend>
+      <label for=""endpointUrl"">Endpoint URL</label>
+      <input type=""url"" id=""endpointUrl"" name=""endpointUrl"" value=""{Enc(project.EndpointUrl)}"" placeholder=""https://your-resource.openai.azure.com"" required>
+
+      <label for=""endpointKey"">API Key <small>(leave blank to keep current)</small></label>
+      <input type=""password"" id=""endpointKey"" name=""endpointKey"" placeholder=""{(string.IsNullOrEmpty(project.EndpointKey) ? "Enter API key" : "Key is configured — leave blank to keep")}"">
     </fieldset>
 
     <fieldset>
@@ -495,11 +516,18 @@ public static class DashboardRoutes
         var form = ctx.Request.Form;
         var name = form["name"].FirstOrDefault();
         var isActive = form["isActive"].FirstOrDefault() == "true";
+        var allowUserKeys = form["allowUserKeys"].FirstOrDefault() == "true";
         var budgetDaily = ParseDouble(form["budgetDaily"].FirstOrDefault());
         var defaultUserBudgetDaily = ParseDouble(form["defaultUserBudgetDaily"].FirstOrDefault());
 
+        var endpointUrl = form["endpointUrl"].FirstOrDefault()?.Trim();
+        var endpointKey = form["endpointKey"].FirstOrDefault()?.Trim();
+        // If endpoint key is blank, preserve the existing value
+        if (string.IsNullOrEmpty(endpointKey)) endpointKey = project.EndpointKey;
+
         store.UpdateProject(id, name, budgetDaily, defaultUserBudgetDaily, isActive,
-            clearBudgets: true);
+            clearBudgets: true, allowUserKeys: allowUserKeys,
+            endpointUrl: endpointUrl, endpointKey: endpointKey, clearEndpoint: true);
 
         return Results.Redirect($"/dashboard/projects/{WebUtility.UrlEncode(id)}/settings?saved=1");
     }

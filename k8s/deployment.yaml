@@ -5,17 +5,23 @@
 # concurrent writers from multiple pods.
 #
 # Prerequisites:
-#   1. Create the secret with your Azure OpenAI credentials and admin token:
+#   1. Create the secret with your admin token and optional OAuth credentials:
 #      kubectl create secret generic llimit-secrets \
-#        --from-literal=azure-openai-endpoint='https://<resource>.openai.azure.com/' \
-#        --from-literal=azure-openai-api-key='<key>' \
-#        --from-literal=admin-token='<token>'
+#        --from-literal=admin-token='<token>' \
+#        --from-literal=azure-ad-client-id='<client-id>' \
+#        --from-literal=azure-ad-client-secret='<client-secret>' \
+#        --from-literal=azure-ad-tenant-id='<tenant-id>'
 #
 #   2. Apply the PVC (see k8s/pvc.yaml) for SQLite database persistence.
 #
+#   3. Each project has its own Azure OpenAI endpoint URL and API key,
+#      configured via the admin API or dashboard when creating projects.
+#
 # External services:
 #   - Azure OpenAI: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
-#     The proxy forwards requests to the configured Azure OpenAI endpoint.
+#     The proxy forwards requests to project-specific Azure OpenAI endpoints.
+#   - Azure AD / Entra: https://learn.microsoft.com/en-us/entra/identity-platform/
+#     OAuth login for the user portal (optional).
 #   - LiteLLM pricing: https://github.com/BerriAI/litellm
 #     Model pricing is fetched from LiteLLM's public model_prices JSON on startup
 #     and refreshed every 6 hours.
@@ -53,18 +59,6 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            # Azure OpenAI Service endpoint and API key.
-            # See: https://learn.microsoft.com/en-us/azure/ai-services/openai/quickstart
-            - name: AZURE_OPENAI_ENDPOINT
-              valueFrom:
-                secretKeyRef:
-                  name: llimit-secrets
-                  key: azure-openai-endpoint
-            - name: AZURE_OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: llimit-secrets
-                  key: azure-openai-api-key
             - name: LLIMIT_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -72,6 +66,27 @@ spec:
                   key: admin-token
             - name: LLIMIT_DB_PATH
               value: /data/llimit.db
+            # Azure AD / Entra OAuth (optional — enables user portal)
+            - name: AZURE_AD_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-ad-client-id
+                  optional: true
+            - name: AZURE_AD_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-ad-client-secret
+                  optional: true
+            - name: AZURE_AD_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-ad-tenant-id
+                  optional: true
+            - name: AZURE_AD_CORPORATE_DOMAIN
+              value: "contoso.com"  # Change to your corporate domain
           volumeMounts:
             - name: data
               mountPath: /data
