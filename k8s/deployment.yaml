@@ -1,0 +1,100 @@
+# LLimit Kubernetes Deployment
+#
+# Deploys the LLM cost gateway proxy as a single-replica pod with persistent
+# SQLite storage. Uses Recreate strategy because SQLite doesn't support
+# concurrent writers from multiple pods.
+#
+# Prerequisites:
+#   1. Create the secret with your Azure OpenAI credentials and admin token:
+#      kubectl create secret generic llimit-secrets \
+#        --from-literal=azure-openai-endpoint='https://<resource>.openai.azure.com/' \
+#        --from-literal=azure-openai-api-key='<key>' \
+#        --from-literal=admin-token='<token>'
+#
+#   2. Apply the PVC (see k8s/pvc.yaml) for SQLite database persistence.
+#
+# External services:
+#   - Azure OpenAI: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
+#     The proxy forwards requests to the configured Azure OpenAI endpoint.
+#   - LiteLLM pricing: https://github.com/BerriAI/litellm
+#     Model pricing is fetched from LiteLLM's public model_prices JSON on startup
+#     and refreshed every 6 hours.
+#
+# Docs:
+#   - Deployment: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+#   - Probes: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+#   - Secrets: https://kubernetes.io/docs/concepts/configuration/secret/
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llimit
+  labels:
+    app: llimit
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate) because SQLite allows only one writer process.
+  # See: https://www.sqlite.org/wal.html
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: llimit
+  template:
+    metadata:
+      labels:
+        app: llimit
+    spec:
+      # Allow 30s for in-flight requests to drain on shutdown.
+      # Matches ASP.NET Core's default ShutdownTimeout.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: llimit
+          image: llimit:latest
+          ports:
+            - containerPort: 8080
+          env:
+            # Azure OpenAI Service endpoint and API key.
+            # See: https://learn.microsoft.com/en-us/azure/ai-services/openai/quickstart
+            - name: AZURE_OPENAI_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-openai-endpoint
+            - name: AZURE_OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: azure-openai-api-key
+            - name: LLIMIT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llimit-secrets
+                  key: admin-token
+            - name: LLIMIT_DB_PATH
+              value: /data/llimit.db
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: llimit-data
